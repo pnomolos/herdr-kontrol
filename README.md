@@ -12,15 +12,15 @@ Alpha. macOS arm64. Glance+focus only — no send-keys / approve.
 
 | Hardware | Function |
 |---|---|
-| Pads 1–8 | Attention-sorted working set (blocked > working > done > idle). Press focuses. 9+ page via ← → (top two pad rows stay dark on page 1). |
+| Pads 1–8 | Working set in stable workspace/pane order (status does not reshuffle pads). Press focuses the herdr pane and raises the host terminal/IDE. 9+ page via ← → (top two pad rows stay dark on page 1). |
 | Groups A–H | Workspaces by `number`; press focuses |
 | Dual screens | Left: selected occupant (hero/task). Right: attention queue (up to 8 rows / page) |
 | Encoder | Cycle selection |
-| Encoder press | `agent.focus` |
+| Encoder press | `pane.focus` |
 | Top buttons | Focus occupied pads 1–8 |
 | ← → | Page |
 
-Talks to `~/.config/herdr/herdr.sock` (`session.snapshot` + `events.subscribe` + `agent.focus`).
+Talks to `~/.config/herdr/herdr.sock` (`session.snapshot` + `events.subscribe` + `pane.focus` / `agent.focus`). herdr 0.9 independent client views: pad press uses `pane.focus` so the attached TUI follows; `agent.focus` alone only updates the server record.
 
 ## Install
 
@@ -52,4 +52,4 @@ cargo run --release -- restore
 
 `--no-inhibit` if you already killed NIHIA. `--no-restore` leaves NI agents down.
 
-herdr 0.8.x, protocol 19.
+herdr 0.9.x, protocol 22.

@@ -144,6 +144,9 @@ mod tests {
             state_change_seq: 1,
             cwd: None,
             foreground_cwd: None,
+            interactive_ready: false,
+            launch_pending: false,
+            screen_detection_skipped: false,
             revision: 1,
         }
     }

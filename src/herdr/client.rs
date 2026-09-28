@@ -8,7 +8,7 @@ use tracing::{debug, info};
 
 use super::types::{HerdrEvent, SessionSnapshot, SnapshotResult, WireLine};
 
-/// Herdr 0.8 closes the API socket after each non-subscribe RPC; events use a dedicated conn.
+/// Herdr 0.9 closes the API socket after each non-subscribe RPC; events use a dedicated conn.
 pub struct HerdrClient {
     socket: PathBuf,
     events: Option<BufReader<UnixStream>>,
@@ -52,6 +52,16 @@ impl HerdrClient {
             "tab.focused",
             "tab.created",
             "tab.closed",
+            "tab.moved",
+            "tab.renamed",
+            "layout.updated",
+            "workspace.reordered",
+            "workspace.moved",
+            "workspace.renamed",
+            "workspace.metadata_updated",
+            "worktree.created",
+            "worktree.opened",
+            "worktree.removed",
         ]
         .into_iter()
         .map(|t| serde_json::json!({"type": t}))
@@ -99,6 +109,18 @@ impl HerdrClient {
             &self.socket,
             "agent.focus",
             serde_json::json!({ "target": target }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// herdr 0.9: this is the RPC that moves an attached TUI client's viewport.
+    /// `agent.focus` / `workspace.focus` often only update the server focus record.
+    pub async fn focus_pane(&self, pane_id: &str) -> Result<()> {
+        let _ = rpc(
+            &self.socket,
+            "pane.focus",
+            serde_json::json!({ "pane_id": pane_id }),
         )
         .await?;
         Ok(())

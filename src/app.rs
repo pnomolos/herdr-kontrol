@@ -85,11 +85,20 @@ pub async fn run(opts: Options) -> Result<()> {
             ev = hid_rx.recv() => {
                 let Some(ev) = ev else { break };
                 if let Some(cmd) = handle_hid(&mut model, ev) {
+                    let hint = match &cmd {
+                        Cmd::Focus(f) => model.window_hint_for_pane(&f.occupant_id),
+                        Cmd::FocusWorkspace { workspace_id, .. } => {
+                            model.window_hint_for_workspace(workspace_id)
+                        }
+                    };
                     if let Some(h) = herdr.as_mut() {
                         if let Err(e) = dispatch(h, cmd).await {
                             warn!(%e, "herdr command failed");
                         }
                     }
+                    std::mem::drop(tokio::task::spawn_blocking(move || {
+                        crate::host::raise(hint.as_deref())
+                    }));
                 }
                 leds_dirty = true;
                 screens_dirty = true;
@@ -179,6 +188,13 @@ pub async fn run(opts: Options) -> Result<()> {
                         continue;
                     }
                 }
+                // 0.9 does not replay retained events; subscribe before snapshot.
+                if let Err(e) =
+                    resubscribe(&opts.socket, &[], &mut ev_task, ev_tx.clone()).await
+                {
+                    warn!(%e, "subscribe");
+                }
+                last_pane_ids.clear();
                 let pane_ids = match rpc.snapshot().await {
                     Ok(snap) => {
                         let ids = snap_pane_ids(&snap);
@@ -190,12 +206,14 @@ pub async fn run(opts: Options) -> Result<()> {
                         continue;
                     }
                 };
-                last_pane_ids = pane_ids.clone();
-                if let Err(e) =
-                    resubscribe(&opts.socket, &pane_ids, &mut ev_task, ev_tx.clone()).await
-                {
-                    warn!(%e, "subscribe");
-                }
+                maybe_resubscribe(
+                    &opts.socket,
+                    pane_ids,
+                    &mut last_pane_ids,
+                    &mut ev_task,
+                    ev_tx.clone(),
+                )
+                .await;
                 info!("herdr connected");
                 herdr = Some(rpc);
                 leds_dirty = true;
@@ -246,11 +264,11 @@ async fn resubscribe(
     ev_task: &mut Option<tokio::task::JoinHandle<()>>,
     ev_tx: mpsc::UnboundedSender<Result<HerdrEvent>>,
 ) -> Result<()> {
+    let mut sub = HerdrClient::new(socket);
+    sub.subscribe(pane_ids).await?;
     if let Some(t) = ev_task.take() {
         t.abort();
     }
-    let mut sub = HerdrClient::new(socket);
-    sub.subscribe(pane_ids).await?;
     *ev_task = Some(tokio::spawn(async move {
         loop {
             match sub.next_event().await {
@@ -283,10 +301,11 @@ async fn maybe_resubscribe(
     if same_pane_ids(&ids, last_pane_ids) {
         return;
     }
-    *last_pane_ids = ids;
-    if let Err(e) = resubscribe(socket, last_pane_ids, ev_task, ev_tx).await {
+    if let Err(e) = resubscribe(socket, &ids, ev_task, ev_tx).await {
         warn!(%e, "resubscribe");
+        return;
     }
+    *last_pane_ids = ids;
 }
 
 fn same_pane_ids(a: &[String], b: &[String]) -> bool {
@@ -312,7 +331,10 @@ fn apply_visible(
 #[derive(Debug)]
 enum Cmd {
     Focus(Focus),
-    FocusWorkspace(String),
+    FocusWorkspace {
+        workspace_id: String,
+        pane_id: Option<String>,
+    },
 }
 
 fn focus_pad(model: &mut AttentionModel, physical: u8) -> Option<Cmd> {
@@ -355,9 +377,13 @@ fn handle_hid(model: &mut AttentionModel, ev: HidEvent) -> Option<Cmd> {
         HidEvent::Button {
             button: Button::Group(g),
             pressed: true,
-        } => model
-            .group_workspace(g)
-            .map(|w| Cmd::FocusWorkspace(w.workspace_id.clone())),
+        } => model.group_workspace(g).map(|w| {
+            let workspace_id = w.workspace_id.clone();
+            Cmd::FocusWorkspace {
+                pane_id: model.pane_id_in_workspace(&workspace_id),
+                workspace_id,
+            }
+        }),
         _ => None,
     }
 }
@@ -365,12 +391,21 @@ fn handle_hid(model: &mut AttentionModel, ev: HidEvent) -> Option<Cmd> {
 async fn dispatch(herdr: &mut HerdrClient, cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Focus(f) => {
-            info!(pane = %f.occupant_id, "focus agent");
-            herdr.focus_agent(&f.occupant_id).await
+            // 0.9.0: only pane.focus projects the attached TUI. agent.focus
+            // updates the server record and is a no-op on the viewport.
+            info!(pane = %f.occupant_id, "focus pane");
+            herdr.focus_pane(&f.occupant_id).await
         }
-        Cmd::FocusWorkspace(id) => {
-            info!(ws = %id, "focus workspace");
-            herdr.focus_workspace(&id).await
+        Cmd::FocusWorkspace {
+            workspace_id,
+            pane_id,
+        } => {
+            info!(ws = %workspace_id, "focus workspace");
+            herdr.focus_workspace(&workspace_id).await?;
+            if let Some(pane_id) = pane_id {
+                herdr.focus_pane(&pane_id).await?;
+            }
+            Ok(())
         }
     }
 }
@@ -583,6 +618,9 @@ mod tests {
             state_change_seq: 1,
             cwd: None,
             foreground_cwd: None,
+            interactive_ready: false,
+            launch_pending: false,
+            screen_detection_skipped: false,
             revision: 1,
         }
     }
@@ -639,6 +677,33 @@ mod tests {
             },
         )
         .is_none());
+        // Group still emits workspace+pane so 0.9 TUI can follow.
+        model.workspaces = vec![crate::herdr::WorkspaceInfo {
+            workspace_id: "w1".into(),
+            number: 1,
+            label: "worky".into(),
+            focused: true,
+            pane_count: 2,
+            tab_count: 1,
+            active_tab_id: "w1:t1".into(),
+            agent_status: AgentStatus::Idle,
+        }];
+        match handle_hid(
+            &mut model,
+            HidEvent::Button {
+                button: Button::Group(0),
+                pressed: true,
+            },
+        ) {
+            Some(Cmd::FocusWorkspace {
+                workspace_id,
+                pane_id,
+            }) => {
+                assert_eq!(workspace_id, "w1");
+                assert_eq!(pane_id.as_deref(), Some("block"));
+            }
+            other => panic!("{other:?}"),
+        }
         match handle_hid(
             &mut model,
             HidEvent::Button {

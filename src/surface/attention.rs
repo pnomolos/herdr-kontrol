@@ -30,6 +30,20 @@ impl From<&AgentInfo> for Focus {
     }
 }
 
+fn layout_cmp(workspaces: &[WorkspaceInfo], a: &AgentInfo, b: &AgentInfo) -> std::cmp::Ordering {
+    workspace_number(workspaces, &a.workspace_id)
+        .cmp(&workspace_number(workspaces, &b.workspace_id))
+        .then(a.pane_id.cmp(&b.pane_id))
+}
+
+fn workspace_number(workspaces: &[WorkspaceInfo], id: &str) -> u64 {
+    workspaces
+        .iter()
+        .find(|w| w.workspace_id == id)
+        .map(|w| w.number)
+        .unwrap_or(u64::MAX)
+}
+
 fn pane_is_shell(pane: &PaneInfo) -> bool {
     let has_agent = pane
         .agent
@@ -64,6 +78,7 @@ pub const PAGE: usize = 8;
 #[derive(Clone, Debug, Default)]
 pub struct AttentionModel {
     pub workspaces: Vec<WorkspaceInfo>,
+    pub panes: Vec<PaneInfo>,
     pub agents: Vec<AgentInfo>,
     pub page: usize,
     pub selected: usize,
@@ -75,6 +90,7 @@ impl AttentionModel {
     pub fn from_snapshot(snap: SessionSnapshot) -> Self {
         let mut m = Self {
             workspaces: snap.workspaces,
+            panes: snap.panes.clone(),
             agents: occupants(snap.agents, snap.panes),
             connected: true,
             ..Self::default()
@@ -89,10 +105,10 @@ impl AttentionModel {
     pub fn apply_snapshot(&mut self, snap: SessionSnapshot) {
         let sel_id = self.selected_pane_id();
         self.workspaces = snap.workspaces;
-        self.agents = occupants(snap.agents, snap.panes);
+        self.panes = snap.panes.clone();
+        self.merge_agents(occupants(snap.agents, snap.panes));
         self.connected = true;
         self.sort_workspaces();
-        self.sort_agents();
         if let Some(id) = sel_id {
             if let Some(i) = self.agents.iter().position(|a| a.pane_id == id) {
                 self.selected = i;
@@ -100,6 +116,24 @@ impl AttentionModel {
         }
         self.retarget_attention();
         self.clamp();
+    }
+
+    /// Keep existing pad order; append newcomers by workspace number then pane id.
+    fn merge_agents(&mut self, incoming: Vec<AgentInfo>) {
+        let mut next: std::collections::HashMap<String, AgentInfo> = incoming
+            .into_iter()
+            .map(|a| (a.pane_id.clone(), a))
+            .collect();
+        let mut out = Vec::with_capacity(next.len());
+        for a in self.agents.drain(..) {
+            if let Some(n) = next.remove(&a.pane_id) {
+                out.push(n);
+            }
+        }
+        let mut rest: Vec<_> = next.into_values().collect();
+        rest.sort_by(|a, b| layout_cmp(&self.workspaces, a, b));
+        out.extend(rest);
+        self.agents = out;
     }
 
     /// Steal selection for a blocked occupant unless the current one is already blocked.
@@ -131,13 +165,8 @@ impl AttentionModel {
     }
 
     pub fn sort_agents(&mut self) {
-        self.agents.sort_by(|a, b| {
-            a.agent_status
-                .attention_rank()
-                .cmp(&b.agent_status.attention_rank())
-                .then(b.state_change_seq.cmp(&a.state_change_seq))
-                .then(a.pane_id.cmp(&b.pane_id))
-        });
+        let workspaces = &self.workspaces;
+        self.agents.sort_by(|a, b| layout_cmp(workspaces, a, b));
     }
 
     pub fn page_count(&self) -> usize {
@@ -169,6 +198,23 @@ impl AttentionModel {
 
     pub fn selected_agent(&self) -> Option<&AgentInfo> {
         self.agents.get(self.selected)
+    }
+
+    pub fn window_hint_for_pane(&self, pane_id: &str) -> Option<String> {
+        let ws = self
+            .agents
+            .iter()
+            .find(|a| a.pane_id == pane_id)
+            .map(|a| a.workspace_id.as_str())?;
+        self.window_hint_for_workspace(ws)
+    }
+
+    pub fn window_hint_for_workspace(&self, workspace_id: &str) -> Option<String> {
+        self.workspaces
+            .iter()
+            .find(|w| w.workspace_id == workspace_id)
+            .map(|w| w.label.clone())
+            .filter(|s| !s.is_empty())
     }
 
     /// LCD-visible state only; skip unselected OSC chatter so spinner ticks don't 522KB-blit.
@@ -249,6 +295,39 @@ impl AttentionModel {
 
     pub fn group_workspace(&self, group: u8) -> Option<&WorkspaceInfo> {
         self.workspaces.get(group as usize)
+    }
+
+    /// A pane the 0.9 TUI can land on. Prefer the workspace's active tab.
+    pub fn pane_id_in_workspace(&self, workspace_id: &str) -> Option<String> {
+        let tab = self
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == workspace_id)
+            .map(|w| w.active_tab_id.as_str())
+            .filter(|t| !t.is_empty());
+        if let Some(tab) = tab {
+            if let Some(p) = self
+                .panes
+                .iter()
+                .find(|p| p.tab_id == tab && p.focused)
+                .or_else(|| self.panes.iter().find(|p| p.tab_id == tab))
+            {
+                return Some(p.pane_id.clone());
+            }
+            if let Some(a) = self.agents.iter().find(|a| a.tab_id == tab) {
+                return Some(a.pane_id.clone());
+            }
+        }
+        self.agents
+            .iter()
+            .find(|a| a.workspace_id == workspace_id)
+            .map(|a| a.pane_id.clone())
+            .or_else(|| {
+                self.panes
+                    .iter()
+                    .find(|p| p.workspace_id == workspace_id)
+                    .map(|p| p.pane_id.clone())
+            })
     }
 
     pub fn drop_pane(&mut self, pane_id: &str) {
@@ -338,11 +417,13 @@ impl AttentionModel {
                 state_change_seq: 1,
                 cwd: None,
                 foreground_cwd: None,
+                interactive_ready: false,
+                launch_pending: false,
+                screen_detection_skipped: false,
                 revision: 0,
             });
         }
         let sel = self.selected_pane_id();
-        self.sort_agents();
         self.restore_selection(sel);
         self.retarget_attention();
         self.clamp();
@@ -426,12 +507,15 @@ mod tests {
             state_change_seq: seq,
             cwd: None,
             foreground_cwd: None,
+            interactive_ready: false,
+            launch_pending: false,
+            screen_detection_skipped: false,
             revision: 1,
         }
     }
 
     #[test]
-    fn attention_order() {
+    fn status_does_not_reorder_pads() {
         let mut snap = empty_snap();
         snap.agents = vec![
             agent("idle", AgentStatus::Idle, 1),
@@ -439,9 +523,12 @@ mod tests {
             agent("work", AgentStatus::Working, 9),
             agent("done", AgentStatus::Done, 3),
         ];
-        let m = AttentionModel::from_snapshot(snap);
+        let mut m = AttentionModel::from_snapshot(snap);
         let ids: Vec<_> = m.agents.iter().map(|a| a.pane_id.as_str()).collect();
-        assert_eq!(ids, ["block", "work", "done", "idle"]);
+        assert_eq!(ids, ["block", "done", "idle", "work"]);
+        m.upsert_status("idle", "w1".into(), AgentStatus::Blocked, None, None, None);
+        let ids: Vec<_> = m.agents.iter().map(|a| a.pane_id.as_str()).collect();
+        assert_eq!(ids, ["block", "done", "idle", "work"]);
     }
 
     #[test]
@@ -568,7 +655,7 @@ mod tests {
         };
         let m = AttentionModel::from_snapshot(snap);
         let ids: Vec<_> = m.agents.iter().map(|a| a.pane_id.as_str()).collect();
-        assert_eq!(ids, ["w3:p1", "w1:p1"]);
+        assert_eq!(ids, ["w1:p1", "w3:p1"]);
     }
 
     #[test]
@@ -619,9 +706,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ("block", Occupancy::Blocked),
-                ("work", Occupancy::Working),
                 ("done", Occupancy::Idle),
                 ("idle", Occupancy::Idle),
+                ("work", Occupancy::Working),
             ]
         );
         assert_eq!(
@@ -670,7 +757,13 @@ mod tests {
         ];
         m.apply_snapshot(snap);
         assert_eq!(m.selected_pane_id().as_deref(), Some("block"));
-        assert_eq!(m.agents[0].pane_id, "block");
+        assert_eq!(
+            m.agents
+                .iter()
+                .map(|a| a.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            ["done", "block"]
+        );
     }
 
     #[test]
@@ -704,12 +797,14 @@ mod tests {
 
     #[test]
     fn upsert_keeps_selected_pane_across_reorder() {
-        let mut snap = empty_snap();
-        snap.agents = vec![
-            agent("work", AgentStatus::Working, 9),
-            agent("idle", AgentStatus::Idle, 1),
-        ];
-        let mut m = AttentionModel::from_snapshot(snap);
+        let mut m = AttentionModel {
+            agents: vec![
+                agent("work", AgentStatus::Working, 9),
+                agent("idle", AgentStatus::Idle, 1),
+            ],
+            connected: true,
+            ..Default::default()
+        };
         assert_eq!(m.selected_pane_id().as_deref(), Some("work"));
         m.upsert_status("idle", "w1".into(), AgentStatus::Done, None, None, None);
         assert_eq!(m.selected_pane_id().as_deref(), Some("work"));

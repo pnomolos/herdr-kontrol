@@ -57,6 +57,12 @@ pub struct AgentInfo {
     pub cwd: Option<String>,
     #[serde(default)]
     pub foreground_cwd: Option<String>,
+    #[serde(default)]
+    pub interactive_ready: bool,
+    #[serde(default)]
+    pub launch_pending: bool,
+    #[serde(default)]
+    pub screen_detection_skipped: bool,
     pub revision: u64,
 }
 
@@ -180,6 +186,9 @@ impl PaneInfo {
             state_change_seq: self.revision,
             cwd: self.cwd,
             foreground_cwd: self.foreground_cwd,
+            interactive_ready: false,
+            launch_pending: false,
+            screen_detection_skipped: false,
             revision: self.revision,
         }
     }
@@ -284,12 +293,50 @@ impl HerdrEvent {
                 pane_id: str_field(pane, "pane_id"),
             },
             // pane.updated is partial; missing agent_status would clobber to Unknown — snapshot.
-            "pane_created" | "pane.created" | "pane_exited" | "pane.exited" | "pane_moved"
-            | "pane.moved" | "pane_updated" | "pane.updated" | "pane_focused" | "pane.focused"
-            | "workspace_updated" | "workspace.updated" | "workspace_created"
-            | "workspace.created" | "workspace_closed" | "workspace.closed"
-            | "workspace_focused" | "workspace.focused" | "tab_focused" | "tab.focused"
-            | "tab_created" | "tab.created" | "tab_closed" | "tab.closed" => HerdrEvent::Refresh,
+            "pane_created"
+            | "pane.created"
+            | "pane_exited"
+            | "pane.exited"
+            | "pane_moved"
+            | "pane.moved"
+            | "pane_updated"
+            | "pane.updated"
+            | "pane_focused"
+            | "pane.focused"
+            | "workspace_updated"
+            | "workspace.updated"
+            | "workspace_created"
+            | "workspace.created"
+            | "workspace_closed"
+            | "workspace.closed"
+            | "workspace_focused"
+            | "workspace.focused"
+            | "tab_focused"
+            | "tab.focused"
+            | "tab_created"
+            | "tab.created"
+            | "tab_closed"
+            | "tab.closed"
+            | "tab_moved"
+            | "tab.moved"
+            | "tab_renamed"
+            | "tab.renamed"
+            | "workspace_reordered"
+            | "workspace.reordered"
+            | "workspace_renamed"
+            | "workspace.renamed"
+            | "workspace_moved"
+            | "workspace.moved"
+            | "workspace_metadata_updated"
+            | "workspace.metadata_updated"
+            | "layout_updated"
+            | "layout.updated"
+            | "worktree_created"
+            | "worktree.created"
+            | "worktree_opened"
+            | "worktree.opened"
+            | "worktree_removed"
+            | "worktree.removed" => HerdrEvent::Refresh,
             other => HerdrEvent::Other {
                 kind: other.to_string(),
             },
@@ -382,6 +429,10 @@ mod tests {
             "workspace.focused",
             serde_json::json!({"workspace_id": "w1"}),
         );
+        assert!(matches!(ev, HerdrEvent::Refresh));
+        let ev = HerdrEvent::from_wire("layout.updated", serde_json::json!({}));
+        assert!(matches!(ev, HerdrEvent::Refresh));
+        let ev = HerdrEvent::from_wire("workspace.reordered", serde_json::json!({}));
         assert!(matches!(ev, HerdrEvent::Refresh));
     }
 
