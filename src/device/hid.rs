@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use anyhow::{anyhow, Context, Result};
 use hidapi::{HidApi, HidDevice as RawHid};
 use tracing::trace;
@@ -9,11 +11,29 @@ use super::{HID_USAGE_PAGE, PID_MK3, PID_PLUS, VID};
 const REPORT_BUTTONS: u8 = 0x01;
 const REPORT_PADS: u8 = 0x02;
 
+/// Upper nibble of a pad tuple's `d1`, per NI's own decoder (via Encdr's MK3 notes).
+const PAD_SWITCH_ON: u8 = 0x00;
+const PAD_HIT_ON: u8 = 0x10;
+const PAD_SWITCH_OFF: u8 = 0x20;
+const PAD_HIT_OFF: u8 = 0x30;
+const PAD_PRESSURE: u8 = 0x40;
+/// 12-bit pressure hysteresis for the tags that carry settling noise.
+const PAD_PRESS_AT: u16 = 32;
+const PAD_RELEASE_AT: u16 = 16;
+/// Low readings right after a strike are rebound, not a release.
+const PAD_REBOUND: Duration = Duration::from_millis(30);
+
 pub struct HidDevice {
     dev: RawHid,
     buttons: u64,
     encoder: Option<u8>,
-    pads: u16,
+    pads: PadDecoder,
+}
+
+#[derive(Default)]
+struct PadDecoder {
+    held: u16,
+    struck: [Option<Instant>; 16],
 }
 
 #[derive(Clone, Debug)]
@@ -66,11 +86,13 @@ impl HidDevice {
         }
         match buf[0] {
             REPORT_BUTTONS if buf.len() >= 42 => self.decode_buttons(buf, out),
-            REPORT_PADS if buf.len() >= 128 => {
-                self.decode_pads(&buf[..64], out);
-                self.decode_pads(&buf[64..128], out);
+            // Double-pumped: a release can show up only in the second set.
+            REPORT_PADS if buf.len() >= 64 => {
+                let now = Instant::now();
+                for set in buf.chunks_exact(64).take(2) {
+                    self.pads.decode_set(set, now, out);
+                }
             }
-            REPORT_PADS if buf.len() >= 64 => self.decode_pads(buf, out),
             other => trace!(report = other, n = buf.len(), "unhandled HID"),
         }
     }
@@ -108,47 +130,60 @@ impl HidDevice {
             Some(_) => {}
         }
     }
+}
 
-    fn decode_pads(&mut self, buf: &[u8], out: &mut Vec<HidEvent>) {
-        // Ctlra: 16 slots of (pad_index, d1, d2) at buf[1]; pressure=((d1 & 0xf) << 8) | d2; ends at p==0 && d1==0.
-        let mut hit = self.pads;
-        let mut pressures = [0u16; 16];
-        for i in 0..16 {
-            let o = 1 + i * 3;
-            if o + 2 >= buf.len() {
-                break;
-            }
-            let p = buf[o];
-            let d1 = buf[o + 1];
-            let d2 = buf[o + 2];
-            if p == 0 && d1 == 0 {
+impl PadDecoder {
+    /// One 64-byte set: marker byte, then (pad, d1, d2) tuples until an all-zero one.
+    fn decode_set(&mut self, buf: &[u8], now: Instant, out: &mut Vec<HidEvent>) {
+        for t in buf[1..].chunks_exact(3) {
+            let (p, d1, d2) = (t[0], t[1], t[2]);
+            // Pad 0 can report d1 == 0 at low pressure; only all three end the list.
+            if p == 0 && d1 == 0 && d2 == 0 {
                 break;
             }
             if p >= 16 {
                 continue;
             }
             let pressure = ((d1 as u16 & 0xf) << 8) | d2 as u16;
-            pressures[p as usize] = pressure;
-            if pressure > 128 {
-                hit |= 1 << p;
-            } else {
-                hit &= !(1 << p);
-            }
-        }
-        let changed = hit ^ self.pads;
-        for i in 0..16u8 {
-            if changed & (1 << i) == 0 {
+            let bit = 1u16 << p;
+            let held = self.held & bit != 0;
+            let pressed = match d1 & 0xf0 {
+                PAD_HIT_ON => true,
+                PAD_SWITCH_OFF | PAD_HIT_OFF => false,
+                PAD_SWITCH_ON | PAD_PRESSURE => {
+                    if held {
+                        let rebound = self.struck[p as usize]
+                            .is_some_and(|at| now.duration_since(at) < PAD_REBOUND);
+                        pressure > PAD_RELEASE_AT || rebound
+                    } else {
+                        pressure >= PAD_PRESS_AT
+                    }
+                }
+                tag => {
+                    trace!(tag, pad = p, "unknown pad tag");
+                    if held {
+                        pressure > 48
+                    } else {
+                        pressure >= 64
+                    }
+                }
+            };
+            // A strike always counts, so a missed release cannot swallow the next tap.
+            if pressed == held && d1 & 0xf0 != PAD_HIT_ON {
                 continue;
             }
-            let pressed = hit & (1 << i) != 0;
-            let physical = HID_TO_PHYSICAL[i as usize];
+            if pressed {
+                self.held |= bit;
+                self.struck[p as usize] = Some(now);
+            } else {
+                self.held &= !bit;
+            }
             out.push(HidEvent::Pad {
-                physical,
-                pressure: pressures[i as usize],
+                physical: HID_TO_PHYSICAL[p as usize],
+                pressure,
                 pressed,
             });
         }
-        self.pads = hit;
     }
 }
 
@@ -182,7 +217,7 @@ pub fn open_hid() -> Result<HidDevice> {
                     dev: raw,
                     buttons: 0,
                     encoder: None,
-                    pads: 0,
+                    pads: PadDecoder::default(),
                 });
             }
             Err(e) => {
@@ -197,6 +232,85 @@ pub fn open_hid() -> Result<HidDevice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn set(tuples: &[(u8, u8, u8)]) -> [u8; 64] {
+        let mut buf = [0u8; 64];
+        buf[0] = REPORT_PADS;
+        for (i, (p, d1, d2)) in tuples.iter().enumerate() {
+            buf[1 + i * 3..4 + i * 3].copy_from_slice(&[*p, *d1, *d2]);
+        }
+        buf
+    }
+
+    fn edges(out: &[HidEvent]) -> Vec<(u8, bool)> {
+        out.iter()
+            .map(|e| match e {
+                HidEvent::Pad {
+                    physical, pressed, ..
+                } => (*physical, *pressed),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pad_hit_and_explicit_off_ignore_pressure() {
+        let mut d = PadDecoder::default();
+        let mut out = Vec::new();
+        let t = Instant::now();
+        // Hit ON at pressure 1, then Hit OFF with residual pressure.
+        d.decode_set(&set(&[(5, 0x10, 0x01)]), t, &mut out);
+        d.decode_set(&set(&[(5, 0x10, 0x01)]), t, &mut out);
+        d.decode_set(&set(&[(5, 0x3f, 0xff)]), t, &mut out);
+        let pad = HID_TO_PHYSICAL[5];
+        assert_eq!(edges(&out), vec![(pad, true), (pad, true), (pad, false)]);
+    }
+
+    #[test]
+    fn pad_release_only_in_second_set() {
+        // Capture from Encdr's notes: set A still held at 373, set B Hit OFF.
+        let mut d = PadDecoder::default();
+        let mut out = Vec::new();
+        let t = Instant::now();
+        d.decode_set(&set(&[(3, 0x41, 0x75)]), t, &mut out);
+        d.decode_set(&set(&[(3, 0x30, 0x00)]), t, &mut out);
+        let pad = HID_TO_PHYSICAL[3];
+        assert_eq!(edges(&out), vec![(pad, true), (pad, false)]);
+        assert!(matches!(out[0], HidEvent::Pad { pressure: 373, .. }));
+    }
+
+    #[test]
+    fn pad_pressure_hysteresis_and_rebound() {
+        let mut d = PadDecoder::default();
+        let mut out = Vec::new();
+        let t = Instant::now();
+        d.decode_set(&set(&[(2, 0x40, 31)]), t, &mut out);
+        assert!(out.is_empty());
+        d.decode_set(&set(&[(2, 0x40, 32)]), t, &mut out);
+        // Deadband holds; a dip inside the rebound window is not a release.
+        d.decode_set(&set(&[(2, 0x40, 4)]), t + PAD_REBOUND / 2, &mut out);
+        d.decode_set(&set(&[(2, 0x40, 20)]), t + PAD_REBOUND, &mut out);
+        assert_eq!(out.len(), 1);
+        d.decode_set(&set(&[(2, 0x40, 16)]), t + PAD_REBOUND, &mut out);
+        let pad = HID_TO_PHYSICAL[2];
+        assert_eq!(edges(&out), vec![(pad, true), (pad, false)]);
+    }
+
+    #[test]
+    fn pad_zero_low_pressure_is_not_end_of_list() {
+        let mut d = PadDecoder::default();
+        let mut out = Vec::new();
+        // Pad 0 with d1 == 0 (Switch ON, pressure 40), then pad 1.
+        d.decode_set(
+            &set(&[(0, 0x00, 40), (1, 0x10, 0x80)]),
+            Instant::now(),
+            &mut out,
+        );
+        assert_eq!(
+            edges(&out),
+            vec![(HID_TO_PHYSICAL[0], true), (HID_TO_PHYSICAL[1], true)]
+        );
+    }
 
     #[test]
     fn encoder_wrap() {

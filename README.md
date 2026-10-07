@@ -53,3 +53,5 @@ cargo run --release -- restore
 `--no-inhibit` if you already killed NIHIA. `--no-restore` leaves NI agents down.
 
 herdr 0.9.x, protocol 22.
+
+Screen text is [Inter](https://github.com/rsms/inter) (SIL OFL 1.1, `assets/fonts/Inter-LICENSE.txt`), embedded in the binary. `cargo test preview -- --ignored` renders both panels to `target/preview/*.ppm`.

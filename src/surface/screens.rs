@@ -1,13 +1,9 @@
-use embedded_graphics::mono_font::{MonoFont, MonoTextStyle};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
-use embedded_graphics::text::Text;
-use profont::{
-    PROFONT_10_POINT, PROFONT_12_POINT, PROFONT_14_POINT, PROFONT_18_POINT, PROFONT_9_POINT,
-};
 
 use super::attention::{AttentionModel, PAGE};
+use super::text::Face;
 use crate::device::{Screen, DISPLAY_H, DISPLAY_W};
 use crate::herdr::{AgentInfo, AgentStatus};
 
@@ -26,6 +22,14 @@ const SELECT_BG: Rgb565 = Rgb565::new(0x06, 0x0c, 0x10);
 const HEADER_H: u32 = 28;
 const FOOTER_H: u32 = 36;
 const KNOB_W: u32 = DISPLAY_W / 4;
+const MARGIN: u32 = 12;
+
+const TITLE: Face = Face::semibold(20.0);
+const HEADER: Face = Face::semibold(16.0);
+const NOTICE: Face = Face::medium(16.0);
+const BODY: Face = Face::medium(14.0);
+const SMALL: Face = Face::medium(12.0);
+const CAPTION: Face = Face::medium(11.0);
 
 fn left_header(model: &AttentionModel) -> String {
     if !model.connected {
@@ -44,14 +48,7 @@ pub fn draw_left(model: &AttentionModel) -> Screen {
     inverted_header(&mut s, &left_header(model));
 
     if !model.connected {
-        put(
-            &mut s,
-            16,
-            80,
-            "waiting for herdr.sock",
-            &PROFONT_14_POINT,
-            DIM,
-        );
+        put(&mut s, 16, 80, "waiting for herdr.sock", NOTICE, DIM);
         knob_footer(
             &mut s,
             &[("PAGE", None), ("SEL", None), ("WS", None), ("FOCUS", None)],
@@ -61,7 +58,7 @@ pub fn draw_left(model: &AttentionModel) -> Screen {
 
     match model.selected_agent() {
         None => {
-            put(&mut s, 16, 80, "NO OCCUPANTS", &PROFONT_18_POINT, DIM);
+            put(&mut s, 16, 80, "NO OCCUPANTS", TITLE, DIM);
         }
         Some(agent) => {
             fill(
@@ -72,43 +69,29 @@ pub fn draw_left(model: &AttentionModel) -> Screen {
                 6,
                 status_color(agent.agent_status),
             );
-            put(
-                &mut s,
-                12,
-                44,
-                &truncate(&hero_title(agent), 36),
-                &PROFONT_18_POINT,
-                FG,
-            );
+            put(&mut s, MARGIN, 44, &hero_title(agent), TITLE, FG);
             if let Some(sub) = hero_sub(agent) {
-                put(&mut s, 12, 72, &truncate(&sub, 42), &PROFONT_12_POINT, FG);
+                put(&mut s, MARGIN, 72, &sub, BODY, FG);
             }
             put(
                 &mut s,
-                12,
+                MARGIN,
                 100,
                 &agent.status_label().to_uppercase(),
-                &PROFONT_12_POINT,
+                BODY,
                 DIM,
             );
             put(
                 &mut s,
-                12,
+                MARGIN,
                 122,
                 &format!("{}  {}", agent.workspace_id, agent.tab_id),
-                &PROFONT_10_POINT,
+                SMALL,
                 DIM,
             );
             let mut y = 150;
             for (k, v) in agent.tokens.iter().take(4) {
-                put(
-                    &mut s,
-                    12,
-                    y,
-                    &truncate(&format!("{k}  {v}"), 48),
-                    &PROFONT_10_POINT,
-                    FG,
-                );
+                put(&mut s, MARGIN, y, &format!("{k}  {v}"), SMALL, FG);
                 y += 16;
             }
         }
@@ -160,7 +143,7 @@ pub fn draw_right(model: &AttentionModel) -> Screen {
     inverted_header(&mut s, &right_header(model));
 
     if !model.connected {
-        put(&mut s, 16, 80, "start herdr", &PROFONT_14_POINT, DIM);
+        put(&mut s, 16, 80, "start herdr", NOTICE, DIM);
         knob_footer(
             &mut s,
             &[("--", None), ("--", None), ("--", None), ("--", None)],
@@ -171,6 +154,8 @@ pub fn draw_right(model: &AttentionModel) -> Screen {
     let start = model.page.saturating_mul(PAGE);
     let on_page = model.agents.len().saturating_sub(start).min(PAGE);
     let layout = queue_layout(on_page);
+    let cells = layout.cells();
+    let inset = layout.row_h.saturating_sub(layout.face.line_height()) / 2;
     let mut y = HEADER_H + 4;
     for (i, agent) in model.agents.iter().enumerate().skip(start).take(PAGE) {
         if y + layout.row_h + FOOTER_H > DISPLAY_H {
@@ -178,28 +163,26 @@ pub fn draw_right(model: &AttentionModel) -> Screen {
         }
         let selected = i == model.selected;
         if selected {
-            fill(
-                &mut s,
-                0,
-                y.saturating_sub(1),
-                DISPLAY_W,
-                layout.row_h,
-                SELECT_BG,
-            );
+            fill(&mut s, 0, y, DISPLAY_W, layout.row_h, SELECT_BG);
         }
         let color = if selected {
             FG
         } else {
             status_color(agent.agent_status)
         };
-        put(
-            &mut s,
-            8,
-            y,
-            &truncate(&queue_row(agent, selected, i - start), layout.max_chars),
-            layout.font,
-            color,
-        );
+        let row = queue_row(agent, selected, i - start);
+        let top = y + inset;
+        let number = row.number.to_string();
+        let text = [
+            row.mark,
+            &number,
+            row.status,
+            &row.name,
+            row.activity.as_deref().unwrap_or(""),
+        ];
+        for ((x, w), text) in cells.into_iter().zip(text) {
+            put_within(&mut s, x, top, w, text, layout.face, color);
+        }
         y += layout.row_h;
     }
     knob_footer(
@@ -210,30 +193,47 @@ pub fn draw_right(model: &AttentionModel) -> Screen {
 }
 
 struct QueueLayout {
-    font: &'static MonoFont<'static>,
+    face: Face,
     row_h: u32,
-    max_chars: usize,
 }
 
-/// 1–4: ProFont 18 / 44px; 5–6: 14 / 30px; 7–8: 12 / 22px. Fits 272 − header − footer.
+impl QueueLayout {
+    /// (x, width) of the mark, number, status, name and activity cells. Sized
+    /// in ems so the three row sizes share one grid.
+    fn cells(&self) -> [(u32, u32); 5] {
+        let em = |n: f32| (n * self.face.px).round() as u32;
+        let gap = em(0.4);
+        let mark = 8;
+        let number = mark + em(0.8);
+        let status = number + em(0.8) + gap;
+        let name = status + em(2.7) + gap;
+        let activity = name + em(5.1) + gap;
+        [
+            (mark, number - mark),
+            (number, status - number - gap),
+            (status, name - status - gap),
+            (name, activity - name - gap),
+            (activity, DISPLAY_W.saturating_sub(activity + 8)),
+        ]
+    }
+}
+
+/// 1–4: 20px / 44px rows; 5–6: 16 / 30; 7–8: 14 / 22. Fits 272 − header − footer.
 fn queue_layout(on_page: usize) -> QueueLayout {
     if on_page <= 4 {
         QueueLayout {
-            font: &PROFONT_18_POINT,
+            face: Face::medium(20.0),
             row_h: 44,
-            max_chars: 42,
         }
     } else if on_page <= 6 {
         QueueLayout {
-            font: &PROFONT_14_POINT,
+            face: Face::medium(16.0),
             row_h: 30,
-            max_chars: 52,
         }
     } else {
         QueueLayout {
-            font: &PROFONT_12_POINT,
+            face: Face::medium(14.0),
             row_h: 22,
-            max_chars: 64,
         }
     }
 }
@@ -253,21 +253,29 @@ fn queue_activity(agent: &AgentInfo) -> Option<String> {
     Some(t)
 }
 
-fn queue_row(agent: &AgentInfo, selected: bool, physical: usize) -> String {
+#[derive(Debug)]
+struct QueueRow {
+    mark: &'static str,
+    number: usize,
+    status: &'static str,
+    name: String,
+    activity: Option<String>,
+}
+
+fn queue_row(agent: &AgentInfo, selected: bool, physical: usize) -> QueueRow {
     let mark = if selected {
         ">"
     } else if agent.focused {
         "*"
     } else {
-        " "
+        ""
     };
-    let n = physical + 1;
-    let st = match agent.agent_status {
+    let status = match agent.agent_status {
         AgentStatus::Blocked => "BLK",
         AgentStatus::Working => "WRK",
         AgentStatus::Done => "DON",
         AgentStatus::Idle => "IDL",
-        AgentStatus::Unknown => "   ",
+        AgentStatus::Unknown => "",
     };
     let name = {
         let label = agent.label();
@@ -277,36 +285,29 @@ fn queue_row(agent: &AgentInfo, selected: bool, physical: usize) -> String {
             label
         }
     };
-    let extra = queue_activity(agent)
-        .map(|t| format!("  {}", truncate(&t, 24)))
-        .unwrap_or_default();
-    if st.trim().is_empty() {
-        format!("{mark}{n}     {}{}", truncate(&name, 12), extra)
-    } else {
-        format!("{mark}{n} {:3}  {}{}", st, truncate(&name, 12), extra)
+    QueueRow {
+        mark,
+        number: physical + 1,
+        status,
+        name,
+        activity: queue_activity(agent),
     }
 }
 
 fn inverted_header(s: &mut Screen, text: &str) {
     fill(s, 0, 0, DISPLAY_W, HEADER_H, HEADER_BG);
-    put(s, 10, 6, text, &PROFONT_14_POINT, HEADER_FG);
+    let top = HEADER_H.saturating_sub(HEADER.line_height()) / 2;
+    put(s, 10, top, text, HEADER, HEADER_FG);
 }
 
 fn knob_footer(s: &mut Screen, knobs: &[(&str, Option<i32>); 4]) {
     let y = DISPLAY_H - FOOTER_H;
     fill(s, 0, y, DISPLAY_W, 1, GREY);
     for (i, (label, value)) in knobs.iter().enumerate() {
-        let x = i as u32 * KNOB_W;
-        put(
-            s,
-            x + 8,
-            y + 8,
-            &format!("{:<8}", label),
-            &PROFONT_9_POINT,
-            DIM,
-        );
+        let x = i as u32 * KNOB_W + 8;
+        put_within(s, x, y + 5, KNOB_W - 16, label, CAPTION, DIM);
         if let Some(v) = value {
-            put(s, x + 8, y + 20, &format!("{v}"), &PROFONT_10_POINT, FG);
+            put_within(s, x, y + 19, KNOB_W - 16, &v.to_string(), SMALL, FG);
         }
     }
 }
@@ -315,16 +316,10 @@ fn is_shell_osc(s: &str) -> bool {
     s.contains('@') && (s.contains(":~") || s.contains(":/"))
 }
 
-fn ascii_clean(s: &str) -> String {
-    s.replace('…', "...")
-        .replace(['–', '—'], "-")
-        .replace('✳', "")
-}
-
 fn is_noise_fragment(s: &str) -> bool {
     let t = s
         .trim()
-        .trim_matches(|c: char| matches!(c, '.' | '-' | '*'))
+        .trim_matches(|c: char| matches!(c, '.' | '…' | '-' | '*'))
         .trim()
         .to_ascii_lowercase();
     t.is_empty() || is_spinner_token(&t) || is_agent_token(&t)
@@ -369,7 +364,7 @@ fn is_agent_token(t: &str) -> bool {
 }
 
 fn scrub_title(s: &str) -> String {
-    let cleaned = ascii_clean(s);
+    let cleaned = s.replace('✳', "");
     // OSC is `status - activity - title - agent`; first non-noise fragment.
     let best = cleaned
         .split(" - ")
@@ -421,27 +416,24 @@ fn fill(s: &mut Screen, x: u32, y: u32, w: u32, h: u32, c: Rgb565) {
         .draw(s);
 }
 
-fn put(s: &mut Screen, x: u32, y: u32, text: &str, font: &MonoFont<'_>, color: Rgb565) {
-    let style = MonoTextStyle::new(font, color);
-    let _ = Text::new(
+/// One line with its box top at `y`, ellipsized at the right margin.
+fn put(s: &mut Screen, x: u32, y: u32, text: &str, face: Face, color: Rgb565) {
+    put_within(
+        s,
+        x,
+        y,
+        DISPLAY_W.saturating_sub(x + MARGIN),
         text,
-        Point::new(x as i32, y as i32 + font.character_size.height as i32),
-        style,
-    )
-    .draw(s);
+        face,
+        color,
+    );
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
-        return s.to_string();
+fn put_within(s: &mut Screen, x: u32, y: u32, w: u32, text: &str, face: Face, color: Rgb565) {
+    if text.is_empty() {
+        return;
     }
-    if max <= 3 {
-        return s.chars().take(max).collect();
-    }
-    let mut out: String = s.chars().take(max - 3).collect();
-    out.push_str("...");
-    out
+    face.draw(s, x as i32, y as i32, &face.fit(text, w), color);
 }
 
 #[cfg(test)]
@@ -491,7 +483,6 @@ mod tests {
         );
         let title = hero_title(&a);
         assert!(!title.contains('@'), "{title}");
-        assert!(!title.contains('…'), "{title}");
         assert!(!title.ends_with("grok"), "{title}");
         assert!(title.contains("Worky architecture survey"), "{title}");
     }
@@ -545,21 +536,14 @@ mod tests {
     }
 
     #[test]
-    fn truncate_is_ascii() {
-        let t = truncate("Worky architecture survey, leadership data", 24);
-        assert!(t.is_ascii(), "{t}");
-        assert!(t.ends_with("..."), "{t}");
-        assert_eq!(t.chars().count(), 24);
-    }
-
-    #[test]
     fn queue_row_is_name_first() {
         let a = agent("fix auth - grok", "grok1", "w3:p1", AgentStatus::Blocked);
         let row = queue_row(&a, true, 0);
-        assert!(row.starts_with(">1 BLK  grok1"), "{row}");
-        assert!(row.contains("fix auth"), "{row}");
-        assert!(!row.contains("w3:p1"), "{row}");
-        assert!(queue_row(&a, false, 7).starts_with(" 8 BLK  grok1"));
+        assert_eq!((row.mark, row.number, row.status), (">", 1, "BLK"));
+        assert_eq!(row.name, "grok1");
+        assert_eq!(row.activity.as_deref(), Some("fix auth"));
+        let row = queue_row(&a, false, 7);
+        assert_eq!((row.mark, row.number), ("", 8));
     }
 
     #[test]
@@ -571,22 +555,89 @@ mod tests {
             AgentStatus::Working,
         );
         let row = queue_row(&a, false, 1);
-        assert!(row.contains("WRK  grok1"), "{row}");
-        assert!(row.starts_with(" 2 WRK"), "{row}");
-        assert!(!row.to_ascii_lowercase().contains("waiting"), "{row}");
-        assert!(!row.contains("Worky"), "{row}");
+        assert_eq!((row.number, row.status), (2, "WRK"));
+        assert_eq!(row.name, "grok1");
+        assert_eq!(row.activity, None);
     }
 
     #[test]
     fn queue_row_marks_herdr_focus() {
         let mut a = agent("survey - grok", "grok1", "w3:p1", AgentStatus::Idle);
         a.focused = true;
-        assert!(
-            queue_row(&a, false, 2).starts_with("*3 IDL  grok1"),
-            "{}",
-            queue_row(&a, false, 2)
-        );
-        assert!(queue_row(&a, true, 2).starts_with(">3 IDL  grok1"));
+        assert_eq!(queue_row(&a, false, 2).mark, "*");
+        assert_eq!(queue_row(&a, true, 2).mark, ">");
+    }
+
+    #[test]
+    fn queue_cells_fit_every_row_size() {
+        for on_page in [1, 5, 8] {
+            let layout = queue_layout(on_page);
+            let face = layout.face;
+            let [mark, number, status, name, activity] = layout.cells();
+            for m in [">", "*"] {
+                assert_eq!(face.fit(m, mark.1), m);
+            }
+            for n in 1..=PAGE {
+                assert_eq!(face.fit(&n.to_string(), number.1), n.to_string());
+            }
+            for st in ["BLK", "WRK", "DON", "IDL"] {
+                assert_eq!(face.fit(st, status.1), st);
+            }
+            assert_eq!(face.fit("claude12", name.1), "claude12");
+            assert!(mark.0 + mark.1 <= number.0 && number.0 + number.1 < status.0);
+            assert!(status.0 + status.1 < name.0 && name.0 + name.1 < activity.0);
+            // Activity keeps at least half the panel.
+            assert!(activity.0 <= DISPLAY_W / 2 && activity.0 + activity.1 <= DISPLAY_W);
+            assert!(face.line_height() <= layout.row_h);
+        }
+    }
+
+    /// `cargo test preview -- --ignored` writes both panels to target/preview/*.ppm.
+    #[test]
+    #[ignore]
+    fn preview() {
+        let names = [
+            "claude1", "grok1", "codex1", "gemini1", "amp1", "claude2", "pi1", "kiro1",
+        ];
+        let titles = [
+            "✳ Fix pad focus for herdr 0.9 independent client views - claude",
+            "- Waiting for response… - Worky architecture survey, leadership da… - grok",
+            "Réécrire le décodeur – étape 2 - codex",
+            "user@host:~/Projects/worky",
+            "partial blit header layout - amp",
+            "Keep the event socket until the replacement subscribe acks - claude",
+            "survey - pi",
+            "nusb 0.2 port - kiro",
+        ];
+        let statuses = [
+            AgentStatus::Blocked,
+            AgentStatus::Working,
+            AgentStatus::Done,
+            AgentStatus::Idle,
+        ];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/preview");
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in [0, 3, 6, 8] {
+            let mut m = AttentionModel {
+                connected: true,
+                agents: (0..n)
+                    .map(|i| {
+                        let mut a =
+                            agent(titles[i], names[i], &format!("w1:p{i}"), statuses[i % 4]);
+                        a.focused = i == 2;
+                        a
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            m.sort_agents();
+            m.clamp();
+            for (side, screen) in [("left", draw_left(&m)), ("right", draw_right(&m))] {
+                let mut ppm = format!("P6 {DISPLAY_W} {DISPLAY_H} 255\n").into_bytes();
+                ppm.extend(screen.rgb888());
+                std::fs::write(dir.join(format!("{side}-{n}.ppm")), ppm).unwrap();
+            }
+        }
     }
 
     #[test]
@@ -595,6 +646,7 @@ mod tests {
         assert_eq!(queue_layout(4).row_h, 44);
         assert_eq!(queue_layout(6).row_h, 30);
         assert_eq!(queue_layout(8).row_h, 22);
+        assert!(queue_layout(1).face.px > queue_layout(8).face.px);
         let avail = DISPLAY_H - HEADER_H - 4 - FOOTER_H;
         assert!(4 * queue_layout(4).row_h <= avail);
         assert!(6 * queue_layout(6).row_h <= avail);

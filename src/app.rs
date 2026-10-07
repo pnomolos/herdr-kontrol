@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::device::{
-    blit_iface, Brightness, Button, HidEvent, IndexedColor, LedState, Maschine, Screen, ScreenId,
+    Brightness, Button, HidEvent, IndexedColor, LedState, Maschine, Screen, ScreenCache, ScreenId,
 };
 use crate::herdr::{default_socket, HerdrClient, HerdrEvent, SessionSnapshot};
 use crate::surface::{draw_left, draw_right, AttentionModel, Focus, MaschineCaps, PAGE};
@@ -34,7 +34,8 @@ pub async fn run(opts: Options) -> Result<()> {
         interval_us = caps.update_interval_us,
         "maschine hid+bulk open"
     );
-    if let Err(e) = paint(&device, &AttentionModel::default(), true) {
+    let mut shown = ScreenCache::default();
+    if let Err(e) = paint(&device, &AttentionModel::default(), &mut shown, true) {
         warn!(%e, "initial paint");
     }
 
@@ -226,7 +227,7 @@ pub async fn run(opts: Options) -> Result<()> {
             let blit = screens_dirty
                 && (screens_ok || now >= screens_retry)
                 && last_screen_blit.elapsed() >= min_blit;
-            match paint(&device, &model, blit) {
+            match paint(&device, &model, &mut shown, blit) {
                 Ok(()) => {
                     leds_dirty = false;
                     if blit {
@@ -244,6 +245,7 @@ pub async fn run(opts: Options) -> Result<()> {
                         if let Ok(mut dev) = device.lock() {
                             dev.recover_screens();
                         }
+                        shown.invalidate();
                     }
                 }
             }
@@ -434,7 +436,12 @@ fn apply_herdr(model: &mut AttentionModel, ev: HerdrEvent) {
     }
 }
 
-fn paint(device: &Mutex<Maschine>, model: &AttentionModel, blit_screens: bool) -> Result<()> {
+fn paint(
+    device: &Mutex<Maschine>,
+    model: &AttentionModel,
+    shown: &mut ScreenCache,
+    blit_screens: bool,
+) -> Result<()> {
     let mut leds = LedState::default();
     leds.set_transport_connected(model.connected);
     leds.set_nav(model.page > 0, model.page + 1 < model.page_count());
@@ -489,10 +496,8 @@ fn paint(device: &Mutex<Maschine>, model: &AttentionModel, blit_screens: bool) -
         }
         dev.clone_screen()?
     };
-    let left = draw_left(model);
-    let right = draw_right(model);
-    blit_iface(&iface, ScreenId::Left, &left)?;
-    blit_iface(&iface, ScreenId::Right, &right)?;
+    shown.blit(&iface, ScreenId::Left, draw_left(model))?;
+    shown.blit(&iface, ScreenId::Right, draw_right(model))?;
     Ok(())
 }
 
@@ -522,12 +527,10 @@ fn hid_thread(device: Arc<Mutex<Maschine>>, tx: mpsc::UnboundedSender<HidEvent>)
 
 pub async fn probe() -> Result<()> {
     use crate::device::IndexedColor;
-    use embedded_graphics::mono_font::MonoTextStyle;
+    use crate::surface::Face;
     use embedded_graphics::pixelcolor::Rgb565;
     use embedded_graphics::prelude::*;
     use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
-    use embedded_graphics::text::Text;
-    use profont::PROFONT_14_POINT;
 
     let mut dev = Maschine::open()?;
     let mut leds = LedState::default();
@@ -562,19 +565,38 @@ pub async fn probe() -> Result<()> {
 
     let mut left = Screen::fill(Rgb565::new(0x04, 0x08, 0x10));
     let mut right = Screen::fill(Rgb565::new(0x10, 0x04, 0x04));
-    let style = MonoTextStyle::new(&PROFONT_14_POINT, Rgb565::WHITE);
-    let _ = Text::new("herdr-kontrol", Point::new(20, 40), style).draw(&mut left);
-    let _ = Text::new("MK3 HID + bulk OK", Point::new(20, 64), style).draw(&mut left);
-    let _ = Rectangle::new(Point::new(20, 90), Size::new(440, 140))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::new(0x1f, 0x00, 0x00)))
-        .draw(&mut left);
-    let _ = Text::new("right screen", Point::new(20, 40), style).draw(&mut right);
+    let face = Face::medium(16.0);
+    face.draw(&mut left, 20, 24, "herdr-kontrol", Rgb565::WHITE);
+    face.draw(&mut left, 20, 48, "MK3 HID + bulk OK", Rgb565::WHITE);
+    // Pixel byte-order check: each bar must show the colour it is labelled with.
+    let bars = [
+        ("RED", Rgb565::new(0x1f, 0x00, 0x00)),
+        ("GREEN", Rgb565::new(0x00, 0x3f, 0x00)),
+        ("BLUE", Rgb565::new(0x00, 0x00, 0x1f)),
+    ];
+    for (i, (label, color)) in bars.into_iter().enumerate() {
+        let x = 20 + i as i32 * 150;
+        let _ = Rectangle::new(Point::new(x, 90), Size::new(140, 140))
+            .into_styled(PrimitiveStyle::with_fill(color))
+            .draw(&mut left);
+        face.draw(&mut left, x + 8, 236, label, Rgb565::WHITE);
+    }
+    face.draw(&mut right, 20, 24, "right screen", Rgb565::WHITE);
     let _ = Rectangle::new(Point::new(20, 90), Size::new(440, 140))
         .into_styled(PrimitiveStyle::with_fill(Rgb565::new(0x00, 0x3f, 0x00)))
         .draw(&mut right);
-    dev.blit(ScreenId::Left, &left)?;
-    dev.blit(ScreenId::Right, &right)?;
+    let iface = dev.clone_screen()?;
+    let mut shown = ScreenCache::default();
+    shown.blit(&iface, ScreenId::Left, left)?;
+    shown.blit(&iface, ScreenId::Right, right.clone())?;
+    // Partial-blit check: only this box goes over the wire, at an unaligned origin.
+    let _ = Rectangle::new(Point::new(201, 121), Size::new(78, 78))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::WHITE))
+        .draw(&mut right);
+    shown.blit(&iface, ScreenId::Right, right)?;
     println!("pads rainbow, screens painted. mash controls for 12s (ctrl-c to stop).");
+    println!("left: bars must match their RED/GREEN/BLUE labels.");
+    println!("right: a white square centred in an otherwise intact green box.");
 
     let start = std::time::Instant::now();
     loop {
