@@ -5,7 +5,7 @@ use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use super::attention::{AttentionModel, PAGE};
 use super::text::Face;
 use crate::device::{Screen, DISPLAY_H, DISPLAY_W};
-use crate::herdr::{AgentInfo, AgentStatus};
+use crate::model::{AgentInfo, AgentStatus, BlockedKind};
 
 /// High-contrast panel chrome: black field, inverted header, 4 encoder captions.
 const BG: Rgb565 = Rgb565::new(0, 0, 0);
@@ -16,6 +16,9 @@ const HEADER_FG: Rgb565 = Rgb565::new(0, 0, 0);
 const RED: Rgb565 = Rgb565::new(0x1f, 0x08, 0x08);
 const GREEN: Rgb565 = Rgb565::new(0x04, 0x3a, 0x0c);
 const AMBER: Rgb565 = Rgb565::new(0x1f, 0x30, 0x00);
+const ORANGE: Rgb565 = Rgb565::new(0x1f, 0x1c, 0x00);
+const PURPLE: Rgb565 = Rgb565::new(0x14, 0x10, 0x1f);
+const TRACK: Rgb565 = Rgb565::new(0x04, 0x08, 0x08);
 const GREY: Rgb565 = Rgb565::new(0x08, 0x10, 0x10);
 const SELECT_BG: Rgb565 = Rgb565::new(0x06, 0x0c, 0x10);
 
@@ -31,15 +34,74 @@ const BODY: Face = Face::medium(14.0);
 const SMALL: Face = Face::medium(12.0);
 const CAPTION: Face = Face::medium(11.0);
 
+fn backend_name(model: &AttentionModel) -> String {
+    match model.caps.name {
+        "" => "HERDR / REX".into(),
+        n => n.to_uppercase(),
+    }
+}
+
 fn left_header(model: &AttentionModel) -> String {
+    let name = backend_name(model);
     if !model.connected {
-        return "HERDR   NOT RUNNING".into();
+        return format!("{name}   NOT RUNNING");
     }
     let n = model.agents.len();
     if model.page_count() == 1 {
-        format!("HERDR   {n}")
+        format!("{name}   {n}")
     } else {
-        format!("HERDR   P{}/{}   {n}", model.page + 1, model.page_count())
+        format!("{name}   P{}/{}   {n}", model.page + 1, model.page_count())
+    }
+}
+
+/// Status strip under the header; with progress it becomes a bar on a dark track.
+fn status_strip(s: &mut Screen, agent: &AgentInfo) {
+    let color = status_color(agent);
+    match agent.progress {
+        Some(p) => {
+            fill(s, 0, HEADER_H, DISPLAY_W, 6, TRACK);
+            fill(
+                s,
+                0,
+                HEADER_H,
+                DISPLAY_W * p.min(100) as u32 / 100,
+                6,
+                color,
+            );
+        }
+        None => fill(s, 0, HEADER_H, DISPLAY_W, 6, color),
+    }
+}
+
+fn place(agent: &AgentInfo) -> String {
+    agent
+        .place
+        .clone()
+        .unwrap_or_else(|| format!("{}  {}", agent.workspace_id, agent.tab_id))
+}
+
+fn hero_status(agent: &AgentInfo) -> String {
+    let mut st = agent.status_label().to_uppercase();
+    if let Some(p) = agent.progress {
+        st.push_str(&format!("  {p}%"));
+    }
+    st
+}
+
+/// Screen-preview lines: CAPTION rows from `top` down to the footer.
+fn screen_preview(s: &mut Screen, top: u32, text: &str) {
+    let line_h = CAPTION.line_height() + 1;
+    let bottom = DISPLAY_H - FOOTER_H - 2;
+    let rows = (bottom.saturating_sub(top) / line_h) as usize;
+    fill(s, 0, top - 4, DISPLAY_W, 1, GREY);
+    let lines: Vec<&str> = text.lines().filter(|l| !is_rule(l)).collect();
+    let start = lines.len().saturating_sub(rows);
+    let mut y = top;
+    for line in &lines[start..] {
+        // Inter lacks the TUI cursor arrows.
+        let line = line.replace(['❯', '›', '⏵', '▶'], ">");
+        put(s, MARGIN, y, &line, CAPTION, DIM);
+        y += line_h;
     }
 }
 
@@ -48,7 +110,7 @@ pub fn draw_left(model: &AttentionModel) -> Screen {
     inverted_header(&mut s, &left_header(model));
 
     if !model.connected {
-        put(&mut s, 16, 80, "waiting for herdr.sock", NOTICE, DIM);
+        put(&mut s, 16, 80, "waiting for herdr or rex", NOTICE, DIM);
         knob_footer(
             &mut s,
             &[("PAGE", None), ("SEL", None), ("WS", None), ("FOCUS", None)],
@@ -60,35 +122,37 @@ pub fn draw_left(model: &AttentionModel) -> Screen {
         None => {
             put(&mut s, 16, 80, "NO OCCUPANTS", TITLE, DIM);
         }
-        Some(agent) => {
-            fill(
+        Some(agent) if model.selected_screen().is_some() => {
+            // Compact hero over the live screen tail.
+            status_strip(&mut s, agent);
+            put(&mut s, MARGIN, 40, &hero_title(agent), TITLE, FG);
+            let respond = model.caps.respond && agent.awaits_permission();
+            let meta = if respond {
+                format!(
+                    "{}   PLAY yes · SHIFT+PLAY always · STOP no",
+                    hero_status(agent)
+                )
+            } else {
+                format!("{}   {}", hero_status(agent), place(agent))
+            };
+            put(
                 &mut s,
-                0,
-                HEADER_H,
-                DISPLAY_W,
-                6,
-                status_color(agent.agent_status),
+                MARGIN,
+                66,
+                &meta,
+                SMALL,
+                if respond { FG } else { DIM },
             );
+            screen_preview(&mut s, 90, model.selected_screen().unwrap_or(""));
+        }
+        Some(agent) => {
+            status_strip(&mut s, agent);
             put(&mut s, MARGIN, 44, &hero_title(agent), TITLE, FG);
             if let Some(sub) = hero_sub(agent) {
                 put(&mut s, MARGIN, 72, &sub, BODY, FG);
             }
-            put(
-                &mut s,
-                MARGIN,
-                100,
-                &agent.status_label().to_uppercase(),
-                BODY,
-                DIM,
-            );
-            put(
-                &mut s,
-                MARGIN,
-                122,
-                &format!("{}  {}", agent.workspace_id, agent.tab_id),
-                SMALL,
-                DIM,
-            );
+            put(&mut s, MARGIN, 100, &hero_status(agent), BODY, DIM);
+            put(&mut s, MARGIN, 122, &place(agent), SMALL, DIM);
             let mut y = 150;
             for (k, v) in agent.tokens.iter().take(4) {
                 put(&mut s, MARGIN, y, &format!("{k}  {v}"), SMALL, FG);
@@ -143,7 +207,7 @@ pub fn draw_right(model: &AttentionModel) -> Screen {
     inverted_header(&mut s, &right_header(model));
 
     if !model.connected {
-        put(&mut s, 16, 80, "start herdr", NOTICE, DIM);
+        put(&mut s, 16, 80, "start herdr or Rex", NOTICE, DIM);
         knob_footer(
             &mut s,
             &[("--", None), ("--", None), ("--", None), ("--", None)],
@@ -165,11 +229,7 @@ pub fn draw_right(model: &AttentionModel) -> Screen {
         if selected {
             fill(&mut s, 0, y, DISPLAY_W, layout.row_h, SELECT_BG);
         }
-        let color = if selected {
-            FG
-        } else {
-            status_color(agent.agent_status)
-        };
+        let color = if selected { FG } else { status_color(agent) };
         let row = queue_row(agent, selected, i - start);
         let top = y + inset;
         let number = row.number.to_string();
@@ -247,7 +307,7 @@ fn queue_activity(agent: &AgentInfo) -> Option<String> {
         return None;
     }
     let name = agent.label();
-    if t == name || t == agent.pane_id {
+    if t == name || t == agent.pane_id || t == agent.short_id() {
         return None;
     }
     Some(t)
@@ -271,7 +331,12 @@ fn queue_row(agent: &AgentInfo, selected: bool, physical: usize) -> QueueRow {
         ""
     };
     let status = match agent.agent_status {
-        AgentStatus::Blocked => "BLK",
+        AgentStatus::Blocked => match agent.blocked_kind {
+            Some(BlockedKind::Question) => "ASK",
+            Some(BlockedKind::Auth) => "PWD",
+            _ => "BLK",
+        },
+        AgentStatus::Error => "ERR",
         AgentStatus::Working => "WRK",
         AgentStatus::Done => "DON",
         AgentStatus::Idle => "IDL",
@@ -280,7 +345,7 @@ fn queue_row(agent: &AgentInfo, selected: bool, physical: usize) -> QueueRow {
     let name = {
         let label = agent.label();
         if is_shell_osc(&label) {
-            agent.pane_id.clone()
+            agent.short_id()
         } else {
             label
         }
@@ -310,6 +375,14 @@ fn knob_footer(s: &mut Screen, knobs: &[(&str, Option<i32>); 4]) {
             put_within(s, x, y + 19, KNOB_W - 16, &v.to_string(), SMALL, FG);
         }
     }
+}
+
+/// TUI chrome: a line of only box-drawing characters and spaces.
+fn is_rule(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty()
+        && t.chars()
+            .all(|c| ('\u{2500}'..='\u{257f}').contains(&c) || c == ' ')
 }
 
 fn is_shell_osc(s: &str) -> bool {
@@ -383,27 +456,39 @@ fn hero_title(agent: &AgentInfo) -> String {
         return h;
     }
     let label = agent.label();
-    if !is_shell_osc(&label) {
+    if !is_shell_osc(&label) && label != agent.pane_id {
         return label;
     }
-    agent.pane_id.clone()
+    agent.short_id()
 }
 
 fn hero_sub(agent: &AgentInfo) -> Option<String> {
     let title = hero_title(agent);
     let label = agent.label();
-    if label != title && !is_shell_osc(&label) {
-        return Some(format!("{}  {}", label, agent.pane_id));
+    // A user-named pane still says what runs in it.
+    let id = match agent.agent.as_deref() {
+        Some(app) if !app.is_empty() && !label.starts_with(app) => {
+            format!("{app}  {}", agent.short_id())
+        }
+        _ => agent.short_id(),
+    };
+    if label != title && label != agent.pane_id && !is_shell_osc(&label) {
+        return Some(format!("{label}  {id}"));
     }
-    if agent.pane_id != title {
-        return Some(agent.pane_id.clone());
+    if id != title {
+        return Some(id);
     }
     agent.foreground_cwd.clone().or_else(|| agent.cwd.clone())
 }
 
-fn status_color(status: AgentStatus) -> Rgb565 {
-    match status {
-        AgentStatus::Blocked => RED,
+fn status_color(agent: &AgentInfo) -> Rgb565 {
+    match agent.agent_status {
+        AgentStatus::Blocked => match agent.blocked_kind {
+            Some(BlockedKind::Question) => PURPLE,
+            Some(BlockedKind::Auth) => ORANGE,
+            _ => RED,
+        },
+        AgentStatus::Error => RED,
         AgentStatus::Working => GREEN,
         AgentStatus::Done => AMBER,
         AgentStatus::Idle | AgentStatus::Unknown => DIM,
@@ -439,7 +524,7 @@ fn put_within(s: &mut Screen, x: u32, y: u32, w: u32, text: &str, face: Face, co
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::AgentInfo;
+    use crate::model::AgentInfo;
 
     fn agent(title: &str, name: &str, pane: &str, status: AgentStatus) -> AgentInfo {
         AgentInfo {
@@ -464,6 +549,7 @@ mod tests {
             launch_pending: false,
             screen_detection_skipped: false,
             revision: 1,
+            ..Default::default()
         }
     }
 
@@ -633,11 +719,67 @@ mod tests {
             m.sort_agents();
             m.clamp();
             for (side, screen) in [("left", draw_left(&m)), ("right", draw_right(&m))] {
-                let mut ppm = format!("P6 {DISPLAY_W} {DISPLAY_H} 255\n").into_bytes();
-                ppm.extend(screen.rgb888());
-                std::fs::write(dir.join(format!("{side}-{n}.ppm")), ppm).unwrap();
+                write_ppm(&dir.join(format!("{side}-{n}.ppm")), &screen);
             }
         }
+
+        // Rex: permission prompt with progress and a live screen tail.
+        let mut a = agent(
+            "",
+            "claude-code",
+            "block:01a17eec-b5f3-7115-b8bd-4f0d8c7f34d6",
+            AgentStatus::Blocked,
+        );
+        a.blocked_kind = Some(BlockedKind::Permission);
+        a.msg = Some("Allow Bash: cargo test --release?".into());
+        a.progress = Some(60);
+        a.place = Some("silent-thicket / Window 3b0e3fa4".into());
+        let mut q = agent(
+            "",
+            "codex",
+            "block:01a17eec-0000-7115-b8bd-4f0d8c7f0001",
+            AgentStatus::Blocked,
+        );
+        q.blocked_kind = Some(BlockedKind::Question);
+        q.msg = Some("Which branch should I target?".into());
+        let shell = agent(
+            "user@host:~",
+            "zsh",
+            "block:01a17eec-0000-7115-b8bd-4f0d8c7f0002",
+            AgentStatus::Unknown,
+        );
+        let mut m = AttentionModel {
+            connected: true,
+            agents: vec![a.clone(), q, shell],
+            caps: crate::backend::Caps {
+                name: "rex",
+                respond: true,
+                screen: true,
+            },
+            ..Default::default()
+        };
+        m.screen = Some((
+            a.pane_id.clone(),
+            "  Running tests…\n────────────────\n Bash command\n   cargo test --release\n   Run the test suite\n Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don't ask again for cargo test\n   3. No, and tell Claude what to do differently (esc)\n────────────────".into(),
+        ));
+        write_ppm(&dir.join("left-rex.ppm"), &draw_left(&m));
+        write_ppm(&dir.join("right-rex.ppm"), &draw_right(&m));
+        m.screen = None;
+        write_ppm(&dir.join("left-rex-noscreen.ppm"), &draw_left(&m));
+    }
+
+    fn write_ppm(path: &std::path::Path, screen: &Screen) {
+        let mut ppm = format!("P6 {DISPLAY_W} {DISPLAY_H} 255\n").into_bytes();
+        ppm.extend(screen.rgb888());
+        std::fs::write(path, ppm).unwrap();
+    }
+
+    #[test]
+    fn rules_are_chrome() {
+        assert!(is_rule("  ──────── "));
+        assert!(is_rule("╭─────╮"));
+        assert!(!is_rule("│ text │"));
+        assert!(!is_rule(""));
     }
 
     #[test]
@@ -667,6 +809,10 @@ mod tests {
                     )
                 })
                 .collect(),
+            caps: crate::backend::Caps {
+                name: "herdr",
+                ..Default::default()
+            },
             ..Default::default()
         };
         m.sort_agents();

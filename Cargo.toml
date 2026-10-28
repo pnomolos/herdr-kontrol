@@ -2,7 +2,7 @@
 name = "herdr-kontrol"
 version = "0.1.0"
 edition = "2021"
-description = "Maschine MK3 control surface for herdr"
+description = "Maschine MK3 control surface for herdr and Rex"
 license = "MIT"
 repository = "https://github.com/pnomolos/herdr-kontrol"
 publish = false
@@ -19,6 +19,8 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 
 [profile.release]
 lto = true

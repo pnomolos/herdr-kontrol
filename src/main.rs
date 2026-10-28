@@ -18,14 +18,14 @@ impl<W: Write> Write for FlushWriter<W> {
     }
 }
 
-use herdr_kontrol::herdr::default_socket;
+use herdr_kontrol::backend::{self, Choice};
 use herdr_kontrol::nihia::NihiaGuard;
-use herdr_kontrol::{app, nihia};
+use herdr_kontrol::{app, herdr, nihia, rex};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "herdr-kontrol",
-    about = "Maschine MK3 control surface for herdr"
+    about = "Maschine MK3 control surface for herdr and Rex"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -36,8 +36,15 @@ struct Cli {
     /// Leave NI agents down on exit.
     #[arg(long, global = true)]
     no_restore: bool,
+    /// Which runtime to drive. `auto` prefers Rex when its socket answers.
+    #[arg(long, value_enum, default_value_t = Choice::Auto, global = true)]
+    backend: Choice,
+    /// herdr API socket.
     #[arg(long, env = "HERDR_SOCKET_PATH", global = true)]
     socket: Option<PathBuf>,
+    /// Rex server socket. Default: `REX_SERVER`, else ~/Library/Application Support/rex/server.sock.
+    #[arg(long, global = true)]
+    rex_socket: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -50,6 +57,12 @@ enum Cmd {
     Inhibit,
     /// Relaunch the NI agents.
     Restore,
+    /// Connect to the backend without the device and print what the surfaces would show.
+    Watch {
+        /// Also stream the selected pane's screen text.
+        #[arg(long)]
+        screen: bool,
+    },
 }
 
 #[tokio::main]
@@ -61,10 +74,19 @@ async fn main() -> Result<()> {
         .with_writer(|| FlushWriter(io::stderr()))
         .init();
 
-    let cli = Cli::parse();
-    match cli.cmd.unwrap_or(Cmd::Run) {
+    let mut cli = Cli::parse();
+    match cli.cmd.take().unwrap_or(Cmd::Run) {
         Cmd::Inhibit => nihia::kill_agents(),
         Cmd::Restore => nihia::restore_agents(),
+        Cmd::Watch { screen } => {
+            app::watch(
+                app::Options {
+                    backend: backend_config(&cli),
+                },
+                screen,
+            )
+            .await
+        }
         Cmd::Probe => {
             let mut guard = maybe_inhibit(cli.no_inhibit)?;
             let r = app::probe().await;
@@ -76,7 +98,7 @@ async fn main() -> Result<()> {
         Cmd::Run => {
             let mut guard = maybe_inhibit(cli.no_inhibit)?;
             let r = app::run(app::Options {
-                socket: cli.socket.unwrap_or_else(default_socket),
+                backend: backend_config(&cli),
             })
             .await;
             if cli.no_restore {
@@ -84,6 +106,14 @@ async fn main() -> Result<()> {
             }
             r
         }
+    }
+}
+
+fn backend_config(cli: &Cli) -> backend::Config {
+    backend::Config {
+        choice: cli.backend,
+        herdr_socket: cli.socket.clone().unwrap_or_else(herdr::default_socket),
+        rex_socket: cli.rex_socket.clone().unwrap_or_else(rex::default_socket),
     }
 }
 

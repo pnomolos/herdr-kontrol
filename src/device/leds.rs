@@ -102,15 +102,17 @@ impl LedState {
         );
     }
 
+    /// Play (approve) and Stop (deny) lit while the selection can be answered.
+    pub fn set_respond(&mut self, available: bool) {
+        if available {
+            self.set_button(41, Brightness::Bright);
+            self.set_button(43, Brightness::Bright);
+        }
+    }
+
+    /// Stop glows dim while disconnected. Play stays dark here: it means
+    /// "approve available" (`set_respond`); the encoder compass shows connection.
     pub fn set_transport_connected(&mut self, connected: bool) {
-        self.set_button(
-            41,
-            if connected {
-                Brightness::On
-            } else {
-                Brightness::Off
-            },
-        );
         self.set_button(
             43,
             if connected {

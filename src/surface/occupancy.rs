@@ -3,7 +3,7 @@
 //! Host unread (`AgentStatus::Done`) collapses to [`Occupancy::Idle`] at the
 //! runtime edge. Focus chrome, workspace, titles, and permission stay
 //! host-local. [`OccupancySource`] is a separate edge from device adapters;
-//! herdr is the only runtime for now.
+//! Runtimes (herdr, Rex) sit behind [`crate::backend`].
 
 /// Surface occupancy. Host Done collapses to [`Idle`] via `From<AgentStatus>`.
 /// Rank is [`Self::attention_rank`], not derived `Ord` (variant order is not the API).
@@ -48,7 +48,7 @@ impl From<&Occupant> for Focus {
     }
 }
 
-/// Runtime edge. MK3 glance+focus only; no approve / send-keys.
+/// Runtime edge for glance+focus. Approve/deny is a separate backend capability.
 pub trait OccupancySource {
     fn occupants(&self) -> Vec<Occupant>;
 

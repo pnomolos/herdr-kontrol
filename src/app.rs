@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -6,27 +5,20 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::backend::{self, Command, Reply, Update};
 use crate::device::{
     Brightness, Button, HidEvent, IndexedColor, LedState, Maschine, Screen, ScreenCache, ScreenId,
 };
-use crate::herdr::{default_socket, HerdrClient, HerdrEvent, SessionSnapshot};
-use crate::surface::{draw_left, draw_right, AttentionModel, Focus, MaschineCaps, PAGE};
+use crate::model::SessionSnapshot;
+use crate::surface::{draw_left, draw_right, AttentionModel, PAGE};
 
 pub struct Options {
-    pub socket: PathBuf,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            socket: default_socket(),
-        }
-    }
+    pub backend: backend::Config,
 }
 
 pub async fn run(opts: Options) -> Result<()> {
     let device = Arc::new(Mutex::new(Maschine::open()?));
-    let caps = MaschineCaps::mk3().with_exclusive_usb(true);
+    let caps = crate::surface::MaschineCaps::mk3().with_exclusive_usb(true);
     info!(
         exclusive_usb = caps.exclusive_usb,
         cells = caps.grid.cells(),
@@ -47,10 +39,19 @@ pub async fn run(opts: Options) -> Result<()> {
             .spawn(move || hid_thread(device, hid_tx))?;
     }
 
+    info!(
+        backend = ?opts.backend.choice,
+        herdr = %opts.backend.herdr_socket.display(),
+        rex = %opts.backend.rex_socket.display(),
+        "kontrol running"
+    );
+    let (up_tx, mut up_rx) = mpsc::unbounded_channel::<Update>();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
+    let driver = tokio::spawn(backend::run(opts.backend, up_tx, cmd_rx));
+
     let mut model = AttentionModel::default();
-    let mut herdr: Option<HerdrClient> = None;
-    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Result<HerdrEvent>>();
-    let mut ev_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut input = Input::default();
+    let mut watched: Option<String> = None;
     let mut leds_dirty = true;
     let mut screens_dirty = true;
     let mut screens_ok = true;
@@ -60,290 +61,161 @@ pub async fn run(opts: Options) -> Result<()> {
         .unwrap_or_else(Instant::now);
     let min_blit = Duration::from_micros(caps.update_interval_us as u64);
     let mut pulse = tokio::time::interval(Duration::from_millis(400));
-    let mut reconnect = tokio::time::interval(Duration::from_millis(750));
-    reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // herdr does not always emit pane.agent_status_changed for done/idle; poll.
-    let mut refresh = tokio::time::interval(Duration::from_secs(2));
-    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    info!(socket = %opts.socket.display(), "kontrol running");
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut last_pane_ids: Vec<String> = Vec::new();
 
     let run_result: Result<()> = async {
-    loop {
-        tokio::select! {
-            biased;
-            _ = tokio::signal::ctrl_c() => {
-                info!("ctrl-c");
-                break;
-            }
-            _ = sigterm.recv() => {
-                info!("sigterm");
-                break;
-            }
-            ev = hid_rx.recv() => {
-                let Some(ev) = ev else { break };
-                if let Some(cmd) = handle_hid(&mut model, ev) {
-                    let hint = match &cmd {
-                        Cmd::Focus(f) => model.window_hint_for_pane(&f.occupant_id),
-                        Cmd::FocusWorkspace { workspace_id, .. } => {
-                            model.window_hint_for_workspace(workspace_id)
-                        }
-                    };
-                    if let Some(h) = herdr.as_mut() {
-                        if let Err(e) = dispatch(h, cmd).await {
-                            warn!(%e, "herdr command failed");
+        loop {
+            tokio::select! {
+                biased;
+                _ = tokio::signal::ctrl_c() => {
+                    info!("ctrl-c");
+                    break;
+                }
+                _ = sigterm.recv() => {
+                    info!("sigterm");
+                    break;
+                }
+                ev = hid_rx.recv() => {
+                    let Some(ev) = ev else { break };
+                    if let Some(cmd) = handle_hid(&mut model, &mut input, ev) {
+                        if cmd_tx.send(cmd).is_err() {
+                            break;
                         }
                     }
-                    std::mem::drop(tokio::task::spawn_blocking(move || {
-                        crate::host::raise(hint.as_deref())
-                    }));
+                    leds_dirty = true;
+                    screens_dirty = true;
                 }
-                leds_dirty = true;
-                screens_dirty = true;
+                up = up_rx.recv() => {
+                    let Some(up) = up else { break };
+                    apply_update(&mut model, up, &mut leds_dirty, &mut screens_dirty);
+                }
+                _ = pulse.tick() => {
+                    model.pulse = !model.pulse;
+                    leds_dirty = true;
+                }
             }
-            ev = ev_rx.recv() => {
-                match ev {
-                    Some(Ok(HerdrEvent::Refresh)) | Some(Ok(HerdrEvent::AgentDetected { .. })) => {
-                        if let Some(h) = herdr.as_ref() {
-                            match h.snapshot().await {
-                                Ok(snap) => {
-                                    let ids = snap_pane_ids(&snap);
-                                    apply_visible(&mut model, snap, &mut leds_dirty, &mut screens_dirty);
-                                    maybe_resubscribe(
-                                        &opts.socket,
-                                        ids,
-                                        &mut last_pane_ids,
-                                        &mut ev_task,
-                                        ev_tx.clone(),
-                                    )
-                                    .await;
-                                }
-                                Err(e) => warn!(%e, "refresh snapshot"),
+
+            let want = model
+                .caps
+                .screen
+                .then(|| model.selected_pane_id())
+                .flatten();
+            if want != watched {
+                watched = want.clone();
+                let _ = cmd_tx.send(Command::WatchScreen(want));
+            }
+
+            if leds_dirty || screens_dirty {
+                let now = Instant::now();
+                let blit = screens_dirty
+                    && (screens_ok || now >= screens_retry)
+                    && last_screen_blit.elapsed() >= min_blit;
+                match paint(&device, &model, &mut shown, blit) {
+                    Ok(()) => {
+                        leds_dirty = false;
+                        if blit {
+                            screens_ok = true;
+                            screens_dirty = false;
+                            last_screen_blit = now;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(%e, "paint");
+                        leds_dirty = false;
+                        if blit {
+                            screens_ok = false;
+                            screens_retry = Instant::now() + Duration::from_secs(3);
+                            if let Ok(mut dev) = device.lock() {
+                                dev.recover_screens();
                             }
+                            shown.invalidate();
                         }
-                    }
-                    Some(Ok(ev)) => {
-                        let sig = model.view_sig();
-                        apply_herdr(&mut model, ev);
-                        leds_dirty = true;
-                        if model.view_sig() != sig {
-                            screens_dirty = true;
-                        }
-                    }
-                    Some(Err(e)) => {
-                        warn!(%e, "herdr stream died");
-                        if let Some(t) = ev_task.take() {
-                            t.abort();
-                        }
-                        herdr = None;
-                        model.connected = false;
-                        leds_dirty = true;
-                        screens_dirty = true;
-                    }
-                    None => break,
-                }
-            }
-            _ = pulse.tick() => {
-                model.pulse = !model.pulse;
-                leds_dirty = true;
-            }
-            _ = refresh.tick(), if herdr.is_some() => {
-                match herdr.as_ref().unwrap().snapshot().await {
-                    Ok(snap) => {
-                        let ids = snap_pane_ids(&snap);
-                        apply_visible(&mut model, snap, &mut leds_dirty, &mut screens_dirty);
-                        maybe_resubscribe(
-                            &opts.socket,
-                            ids,
-                            &mut last_pane_ids,
-                            &mut ev_task,
-                            ev_tx.clone(),
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        warn!(%e, "periodic snapshot");
-                        if let Some(t) = ev_task.take() {
-                            t.abort();
-                        }
-                        herdr = None;
-                        model.connected = false;
-                        leds_dirty = true;
-                        screens_dirty = true;
-                    }
-                }
-            }
-            _ = reconnect.tick(), if herdr.is_none() => {
-                let rpc = HerdrClient::new(&opts.socket);
-                match rpc.ping().await {
-                    Ok(()) => {}
-                    Err(_) => {
-                        if model.connected {
-                            model.connected = false;
-                            leds_dirty = true;
-                            screens_dirty = true;
-                        }
-                        continue;
-                    }
-                }
-                // 0.9 does not replay retained events; subscribe before snapshot.
-                if let Err(e) =
-                    resubscribe(&opts.socket, &[], &mut ev_task, ev_tx.clone()).await
-                {
-                    warn!(%e, "subscribe");
-                }
-                last_pane_ids.clear();
-                let pane_ids = match rpc.snapshot().await {
-                    Ok(snap) => {
-                        let ids = snap_pane_ids(&snap);
-                        apply_visible(&mut model, snap, &mut leds_dirty, &mut screens_dirty);
-                        ids
-                    }
-                    Err(e) => {
-                        warn!(%e, "snapshot");
-                        continue;
-                    }
-                };
-                maybe_resubscribe(
-                    &opts.socket,
-                    pane_ids,
-                    &mut last_pane_ids,
-                    &mut ev_task,
-                    ev_tx.clone(),
-                )
-                .await;
-                info!("herdr connected");
-                herdr = Some(rpc);
-                leds_dirty = true;
-                screens_dirty = true;
-            }
-        }
-
-        if leds_dirty || screens_dirty {
-            let now = Instant::now();
-            let blit = screens_dirty
-                && (screens_ok || now >= screens_retry)
-                && last_screen_blit.elapsed() >= min_blit;
-            match paint(&device, &model, &mut shown, blit) {
-                Ok(()) => {
-                    leds_dirty = false;
-                    if blit {
-                        screens_ok = true;
-                        screens_dirty = false;
-                        last_screen_blit = now;
-                    }
-                }
-                Err(e) => {
-                    warn!(%e, "paint");
-                    leds_dirty = false;
-                    if blit {
-                        screens_ok = false;
-                        screens_retry = Instant::now() + Duration::from_secs(3);
-                        if let Ok(mut dev) = device.lock() {
-                            dev.recover_screens();
-                        }
-                        shown.invalidate();
                     }
                 }
             }
         }
+        Ok(())
     }
-    Ok(())
-    }.await;
+    .await;
 
+    driver.abort();
     if let Ok(dev) = device.lock() {
         let _ = dev.blank();
     }
     run_result
 }
 
-async fn resubscribe(
-    socket: &std::path::Path,
-    pane_ids: &[String],
-    ev_task: &mut Option<tokio::task::JoinHandle<()>>,
-    ev_tx: mpsc::UnboundedSender<Result<HerdrEvent>>,
-) -> Result<()> {
-    let mut sub = HerdrClient::new(socket);
-    sub.subscribe(pane_ids).await?;
-    if let Some(t) = ev_task.take() {
-        t.abort();
-    }
-    *ev_task = Some(tokio::spawn(async move {
-        loop {
-            match sub.next_event().await {
-                Ok(ev) => {
-                    if ev_tx.send(Ok(ev)).is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    let _ = ev_tx.send(Err(e));
-                    break;
-                }
-            }
-        }
-    }));
-    Ok(())
-}
-
-fn snap_pane_ids(snap: &SessionSnapshot) -> Vec<String> {
-    snap.panes.iter().map(|p| p.pane_id.clone()).collect()
-}
-
-async fn maybe_resubscribe(
-    socket: &std::path::Path,
-    ids: Vec<String>,
-    last_pane_ids: &mut Vec<String>,
-    ev_task: &mut Option<tokio::task::JoinHandle<()>>,
-    ev_tx: mpsc::UnboundedSender<Result<HerdrEvent>>,
-) {
-    if same_pane_ids(&ids, last_pane_ids) {
-        return;
-    }
-    if let Err(e) = resubscribe(socket, &ids, ev_task, ev_tx).await {
-        warn!(%e, "resubscribe");
-        return;
-    }
-    *last_pane_ids = ids;
-}
-
-fn same_pane_ids(a: &[String], b: &[String]) -> bool {
-    a.len() == b.len()
-        && a.iter().collect::<std::collections::HashSet<_>>()
-            == b.iter().collect::<std::collections::HashSet<_>>()
-}
-
-fn apply_visible(
+fn apply_update(
     model: &mut AttentionModel,
-    snap: SessionSnapshot,
+    up: Update,
     leds_dirty: &mut bool,
     screens_dirty: &mut bool,
 ) {
     let sig = model.view_sig();
-    model.apply_snapshot(snap);
+    match up {
+        Update::Connected(caps) => {
+            info!(backend = caps.name, "backend connected");
+            model.caps = caps;
+        }
+        Update::Disconnected => {
+            model.connected = false;
+            model.screen = None;
+        }
+        Update::Snapshot(snap) => apply_snapshot(model, snap),
+        Update::Status(p) => model.upsert_status(
+            &p.pane_id,
+            p.workspace_id,
+            p.agent_status,
+            p.title,
+            p.display_agent,
+            p.agent,
+        ),
+        Update::PaneClosed(id) => model.drop_pane(&id),
+        Update::Screen { pane_id, text } => model.screen = Some((pane_id, text)),
+    }
     *leds_dirty = true;
     if model.view_sig() != sig {
         *screens_dirty = true;
     }
 }
 
-#[derive(Debug)]
-enum Cmd {
-    Focus(Focus),
-    FocusWorkspace {
-        workspace_id: String,
-        pane_id: Option<String>,
-    },
+fn apply_snapshot(model: &mut AttentionModel, snap: SessionSnapshot) {
+    model.apply_snapshot(snap);
 }
 
-fn focus_pad(model: &mut AttentionModel, physical: u8) -> Option<Cmd> {
-    model.select_pad(physical).map(Focus::from).map(Cmd::Focus)
+/// Held modifiers.
+#[derive(Debug, Default)]
+struct Input {
+    shift: bool,
 }
 
-fn handle_hid(model: &mut AttentionModel, ev: HidEvent) -> Option<Cmd> {
+fn focus(model: &AttentionModel, pane_id: String) -> Command {
+    Command::FocusPane {
+        hint: model.window_hint_for_pane(&pane_id),
+        pane_id,
+    }
+}
+
+fn focus_pad(model: &mut AttentionModel, physical: u8) -> Option<Command> {
+    let id = model.select_pad(physical)?.pane_id.clone();
+    Some(focus(model, id))
+}
+
+/// Play/Stop answer the selected pane's permission prompt, if the backend can.
+fn respond(model: &AttentionModel, reply: Reply) -> Option<Command> {
+    if !model.caps.respond {
+        return None;
+    }
+    let a = model.selected_agent().filter(|a| a.awaits_permission())?;
+    Some(Command::Respond {
+        pane_id: a.pane_id.clone(),
+        stamp: a.status_stamp.clone(),
+        reply,
+    })
+}
+
+fn handle_hid(model: &mut AttentionModel, input: &mut Input, ev: HidEvent) -> Option<Command> {
     match ev {
         HidEvent::Pad {
             physical,
@@ -355,9 +227,34 @@ fn handle_hid(model: &mut AttentionModel, ev: HidEvent) -> Option<Cmd> {
             None
         }
         HidEvent::Button {
+            button: Button::Shift,
+            pressed,
+        } => {
+            input.shift = pressed;
+            None
+        }
+        HidEvent::Button {
             button: Button::EncoderPress,
             pressed: true,
-        } => model.selected_agent().map(Focus::from).map(Cmd::Focus),
+        } => {
+            let id = model.selected_pane_id()?;
+            Some(focus(model, id))
+        }
+        HidEvent::Button {
+            button: Button::Play,
+            pressed: true,
+        } => respond(
+            model,
+            if input.shift {
+                Reply::ApproveAlways
+            } else {
+                Reply::Approve
+            },
+        ),
+        HidEvent::Button {
+            button: Button::Stop,
+            pressed: true,
+        } => respond(model, Reply::Deny),
         HidEvent::Button {
             button: Button::ArrowLeft,
             pressed: true,
@@ -379,60 +276,15 @@ fn handle_hid(model: &mut AttentionModel, ev: HidEvent) -> Option<Cmd> {
         HidEvent::Button {
             button: Button::Group(g),
             pressed: true,
-        } => model.group_workspace(g).map(|w| {
-            let workspace_id = w.workspace_id.clone();
-            Cmd::FocusWorkspace {
-                pane_id: model.pane_id_in_workspace(&workspace_id),
-                workspace_id,
-            }
-        }),
-        _ => None,
-    }
-}
-
-async fn dispatch(herdr: &mut HerdrClient, cmd: Cmd) -> Result<()> {
-    match cmd {
-        Cmd::Focus(f) => {
-            // 0.9.0: only pane.focus projects the attached TUI. agent.focus
-            // updates the server record and is a no-op on the viewport.
-            info!(pane = %f.occupant_id, "focus pane");
-            herdr.focus_pane(&f.occupant_id).await
-        }
-        Cmd::FocusWorkspace {
-            workspace_id,
-            pane_id,
         } => {
-            info!(ws = %workspace_id, "focus workspace");
-            herdr.focus_workspace(&workspace_id).await?;
-            if let Some(pane_id) = pane_id {
-                herdr.focus_pane(&pane_id).await?;
-            }
-            Ok(())
+            let workspace_id = model.group_workspace(g)?.workspace_id.clone();
+            Some(Command::FocusWorkspace {
+                pane_id: model.pane_id_in_workspace(&workspace_id),
+                hint: model.window_hint_for_workspace(&workspace_id),
+                workspace_id,
+            })
         }
-    }
-}
-
-fn apply_herdr(model: &mut AttentionModel, ev: HerdrEvent) {
-    match ev {
-        HerdrEvent::Snapshot(s) => model.apply_snapshot(s),
-        HerdrEvent::AgentStatus {
-            pane_id,
-            workspace_id,
-            agent_status,
-            title,
-            display_agent,
-            agent,
-        } => model.upsert_status(
-            &pane_id,
-            workspace_id,
-            agent_status,
-            title,
-            display_agent,
-            agent,
-        ),
-        HerdrEvent::PaneClosed { pane_id } => model.drop_pane(&pane_id),
-        HerdrEvent::Refresh | HerdrEvent::AgentDetected { .. } => {}
-        HerdrEvent::Other { kind } => debug!(kind, "unhandled herdr event"),
+        _ => None,
     }
 }
 
@@ -444,6 +296,13 @@ fn paint(
 ) -> Result<()> {
     let mut leds = LedState::default();
     leds.set_transport_connected(model.connected);
+    leds.set_respond(
+        model.connected
+            && model.caps.respond
+            && model
+                .selected_agent()
+                .is_some_and(|a| a.awaits_permission()),
+    );
     leds.set_nav(model.page > 0, model.page + 1 < model.page_count());
     leds.set_encoder_compass(if model.connected {
         IndexedColor::WHITE
@@ -469,7 +328,7 @@ fn paint(
             let selected = page_start + i == model.selected;
             leds.set_pad_physical(
                 i as u8,
-                AttentionModel::pad_color(agent.agent_status, model.pulse, selected),
+                AttentionModel::pad_color(agent, model.pulse, selected),
             );
             leds.set_top(
                 i as u8,
@@ -523,6 +382,90 @@ fn hid_thread(device: Arc<Mutex<Maschine>>, tx: mpsc::UnboundedSender<HidEvent>)
         }
         std::thread::sleep(Duration::from_millis(4));
     }
+}
+
+/// Backend only, no device: print what the surface would show. Sends no commands
+/// except screen watching (read-only), so it is safe against a live server.
+pub async fn watch(opts: Options, screen: bool) -> Result<()> {
+    let (up_tx, mut up_rx) = mpsc::unbounded_channel::<Update>();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
+    let driver = tokio::spawn(backend::run(opts.backend, up_tx, cmd_rx));
+    let mut model = AttentionModel::default();
+    let mut last = String::new();
+    let mut watched = None;
+    loop {
+        let up = tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            up = up_rx.recv() => match up { Some(u) => u, None => break },
+        };
+        let (mut l, mut s) = (false, false);
+        apply_update(&mut model, up, &mut l, &mut s);
+        let want = (screen && model.caps.screen)
+            .then(|| model.selected_pane_id())
+            .flatten();
+        if want != watched {
+            watched = want.clone();
+            let _ = cmd_tx.send(Command::WatchScreen(want));
+        }
+        let text = render_text(&model);
+        if text != last {
+            println!("{text}");
+            last = text;
+        }
+    }
+    driver.abort();
+    Ok(())
+}
+
+fn render_text(model: &AttentionModel) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    if !model.connected {
+        return "-- disconnected".into();
+    }
+    let _ = writeln!(
+        out,
+        "-- {} · {} groups · {} pads",
+        model.caps.name,
+        model.workspaces.len(),
+        model.agents.len()
+    );
+    for (i, w) in model.workspaces.iter().take(8).enumerate() {
+        let _ = writeln!(
+            out,
+            "   group {} {:<20} {:?}",
+            (b'A' + i as u8) as char,
+            w.label,
+            w.agent_status
+        );
+    }
+    for (i, a) in model.agents.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "{} {:>2} {:<8} {:<11} {:<14} {}{}",
+            if i == model.selected { ">" } else { " " },
+            i + 1,
+            format!("{:?}", a.agent_status),
+            a.blocked_kind.map(|k| k.key()).unwrap_or(""),
+            a.label(),
+            a.headline(),
+            a.progress.map(|p| format!(" [{p}%]")).unwrap_or_default(),
+        );
+    }
+    if let Some(t) = model.selected_screen() {
+        let _ = writeln!(out, "   screen (last 5):");
+        for l in t
+            .lines()
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            let _ = writeln!(out, "   | {l}");
+        }
+    }
+    out.trim_end().to_string()
 }
 
 pub async fn probe() -> Result<()> {
@@ -619,7 +562,7 @@ pub async fn probe() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::{AgentInfo, AgentStatus};
+    use crate::model::{AgentInfo, AgentStatus};
 
     fn agent(id: &str, status: AgentStatus) -> AgentInfo {
         AgentInfo {
@@ -644,17 +587,8 @@ mod tests {
             launch_pending: false,
             screen_detection_skipped: false,
             revision: 1,
+            ..Default::default()
         }
-    }
-
-    #[test]
-    fn pane_ids_ignore_order() {
-        assert!(same_pane_ids(
-            &["b".into(), "a".into()],
-            &["a".into(), "b".into()]
-        ));
-        assert!(!same_pane_ids(&["a".into()], &["a".into(), "b".into()]));
-        assert!(same_pane_ids(&[], &[]));
     }
 
     #[test]
@@ -670,28 +604,31 @@ mod tests {
         model.sort_agents();
         match handle_hid(
             &mut model,
+            &mut Input::default(),
             HidEvent::Pad {
                 physical: 1,
                 pressure: 200,
                 pressed: true,
             },
         ) {
-            Some(Cmd::Focus(f)) => assert_eq!(f.occupant_id, "work"),
+            Some(Command::FocusPane { pane_id, .. }) => assert_eq!(pane_id, "work"),
             other => panic!("{other:?}"),
         }
         assert_eq!(model.selected_pane_id().as_deref(), Some("work"));
         match handle_hid(
             &mut model,
+            &mut Input::default(),
             HidEvent::Button {
                 button: Button::Top(0),
                 pressed: true,
             },
         ) {
-            Some(Cmd::Focus(f)) => assert_eq!(f.occupant_id, "block"),
+            Some(Command::FocusPane { pane_id, .. }) => assert_eq!(pane_id, "block"),
             other => panic!("{other:?}"),
         }
         assert!(handle_hid(
             &mut model,
+            &mut Input::default(),
             HidEvent::Pad {
                 physical: PAGE as u8,
                 pressure: 200,
@@ -700,7 +637,7 @@ mod tests {
         )
         .is_none());
         // Group still emits workspace+pane so 0.9 TUI can follow.
-        model.workspaces = vec![crate::herdr::WorkspaceInfo {
+        model.workspaces = vec![crate::model::WorkspaceInfo {
             workspace_id: "w1".into(),
             number: 1,
             label: "worky".into(),
@@ -712,14 +649,16 @@ mod tests {
         }];
         match handle_hid(
             &mut model,
+            &mut Input::default(),
             HidEvent::Button {
                 button: Button::Group(0),
                 pressed: true,
             },
         ) {
-            Some(Cmd::FocusWorkspace {
+            Some(Command::FocusWorkspace {
                 workspace_id,
                 pane_id,
+                ..
             }) => {
                 assert_eq!(workspace_id, "w1");
                 assert_eq!(pane_id.as_deref(), Some("block"));
@@ -728,13 +667,88 @@ mod tests {
         }
         match handle_hid(
             &mut model,
+            &mut Input::default(),
             HidEvent::Button {
                 button: Button::EncoderPress,
                 pressed: true,
             },
         ) {
-            Some(Cmd::Focus(f)) => assert_eq!(f.occupant_id, "block"),
+            Some(Command::FocusPane { pane_id, .. }) => assert_eq!(pane_id, "block"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn play_stop_answer_only_permission_prompts() {
+        use crate::backend::Caps;
+        use crate::model::BlockedKind;
+        let mut prompt = agent("ask", AgentStatus::Blocked);
+        prompt.blocked_kind = Some(BlockedKind::Permission);
+        prompt.status_stamp = Some("t1".into());
+        prompt.prompt_live = true;
+        let mut question = agent("q", AgentStatus::Blocked);
+        question.blocked_kind = Some(BlockedKind::Question);
+        let mut model = AttentionModel {
+            agents: vec![prompt, question],
+            connected: true,
+            ..AttentionModel::default()
+        };
+        let play = |shift| HidEvent::Button {
+            button: Button::Play,
+            pressed: shift,
+        };
+        // herdr: no respond capability.
+        assert!(handle_hid(&mut model, &mut Input::default(), play(true)).is_none());
+
+        model.caps = Caps {
+            name: "rex",
+            respond: true,
+            screen: true,
+        };
+        let mut input = Input::default();
+        match handle_hid(&mut model, &mut input, play(true)) {
+            Some(Command::Respond {
+                pane_id,
+                stamp,
+                reply,
+            }) => {
+                assert_eq!(pane_id, "ask");
+                assert_eq!(stamp.as_deref(), Some("t1"));
+                assert_eq!(reply, Reply::Approve);
+            }
+            other => panic!("{other:?}"),
+        }
+        handle_hid(
+            &mut model,
+            &mut input,
+            HidEvent::Button {
+                button: Button::Shift,
+                pressed: true,
+            },
+        );
+        assert!(matches!(
+            handle_hid(&mut model, &mut input, play(true)),
+            Some(Command::Respond {
+                reply: Reply::ApproveAlways,
+                ..
+            })
+        ));
+        assert!(matches!(
+            handle_hid(
+                &mut model,
+                &mut input,
+                HidEvent::Button {
+                    button: Button::Stop,
+                    pressed: true
+                }
+            ),
+            Some(Command::Respond {
+                reply: Reply::Deny,
+                ..
+            })
+        ));
+        // A question prompt is not answered with keys.
+        model.selected = 1;
+        assert!(handle_hid(&mut model, &mut input, play(true)).is_none());
     }
 }

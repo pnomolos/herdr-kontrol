@@ -25,6 +25,30 @@ fn raise_inner(window_hint: Option<&str>) -> Result<u32, String> {
     Ok(gui)
 }
 
+/// Raise Rex.app (any channel: "Rex.app", "Rex Beta.app", …).
+pub fn raise_rex() {
+    let r = list_procs().and_then(|procs| {
+        let pid = rex_app_pid(&procs).ok_or_else(|| "Rex.app not running".to_string())?;
+        activate_pid(pid, None)?;
+        Ok(pid)
+    });
+    match r {
+        Ok(pid) => info!(pid, "raised Rex.app"),
+        Err(e) => debug!(%e, "rex raise skipped"),
+    }
+}
+
+fn rex_app_pid(procs: &[Proc]) -> Option<u32> {
+    procs
+        .iter()
+        .find(|p| {
+            // The server is `Rex Server.app/Contents/MacOS/rex` (lowercase).
+            let exe = p.command.split(".app/Contents/MacOS/").nth(1).unwrap_or("");
+            exe == "Rex" || exe.starts_with("Rex ")
+        })
+        .map(|p| p.pid)
+}
+
 fn list_procs() -> Result<Vec<Proc>, String> {
     let out = Command::new("ps")
         .args(["-axo", "pid=,ppid=,command="])
@@ -153,6 +177,16 @@ mod tests {
             ppid,
             command: command.into(),
         }
+    }
+
+    #[test]
+    fn rex_app_not_server() {
+        let procs = vec![
+            p(10, 1, "/Users/me/Library/Application Support/com.superlogical.rex/RexServer/Versions/Current/Rex Server.app/Contents/MacOS/rex server run"),
+            p(11, 1, "/Applications/Rex Beta.app/Contents/MacOS/Rex"),
+        ];
+        assert_eq!(rex_app_pid(&procs), Some(11));
+        assert_eq!(rex_app_pid(&procs[..1]), None);
     }
 
     #[test]

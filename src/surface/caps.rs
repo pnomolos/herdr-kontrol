@@ -1,7 +1,7 @@
 //! Hardware is a concrete caps record (not a negotiated wire) so a later pad
 //! can share glance+focus without inheriting MK3 LCD policy.
-//! Device adapters ([`Surface`]) consume occupancy; herdr is the only runtime
-//! for now.
+//! Device adapters ([`Surface`]) consume occupancy; runtimes (herdr, Rex)
+//! sit behind [`crate::backend`].
 
 use anyhow::Result;
 
@@ -121,7 +121,7 @@ impl<'a> Renderer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::{AgentInfo, AgentStatus};
+    use crate::model::{AgentInfo, AgentStatus};
     use crate::surface::attention::{AttentionModel, PAGE};
     use crate::surface::occupancy::{Occupancy, OccupancySource};
 
@@ -148,6 +148,7 @@ mod tests {
             launch_pending: false,
             screen_detection_skipped: false,
             revision: 1,
+            ..Default::default()
         }
     }
 
