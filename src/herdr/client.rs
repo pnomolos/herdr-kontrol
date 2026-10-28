@@ -6,7 +6,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::{debug, info};
 
-use super::types::{HerdrEvent, SessionSnapshot, SnapshotResult, WireLine};
+use super::types::{HerdrEvent, SnapshotResult, WireLine};
+use crate::model::SessionSnapshot;
 
 /// Herdr 0.9 closes the API socket after each non-subscribe RPC; events use a dedicated conn.
 pub struct HerdrClient {

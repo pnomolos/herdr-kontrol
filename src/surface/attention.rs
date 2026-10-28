@@ -1,11 +1,12 @@
 use super::occupancy::{Focus, Occupancy, OccupancySource, Occupant};
+use crate::backend::Caps;
 use crate::device::IndexedColor;
-use crate::herdr::{AgentInfo, AgentStatus, PaneInfo, SessionSnapshot, WorkspaceInfo};
+use crate::model::{AgentInfo, AgentStatus, BlockedKind, PaneInfo, SessionSnapshot, WorkspaceInfo};
 
 impl From<AgentStatus> for Occupancy {
     fn from(status: AgentStatus) -> Self {
         match status {
-            AgentStatus::Blocked => Self::Blocked,
+            AgentStatus::Blocked | AgentStatus::Error => Self::Blocked,
             AgentStatus::Working => Self::Working,
             AgentStatus::Done | AgentStatus::Idle => Self::Idle,
             AgentStatus::Unknown => Self::Unknown,
@@ -33,6 +34,11 @@ impl From<&AgentInfo> for Focus {
 fn layout_cmp(workspaces: &[WorkspaceInfo], a: &AgentInfo, b: &AgentInfo) -> std::cmp::Ordering {
     workspace_number(workspaces, &a.workspace_id)
         .cmp(&workspace_number(workspaces, &b.workspace_id))
+        .then(
+            a.order
+                .unwrap_or(u64::MAX)
+                .cmp(&b.order.unwrap_or(u64::MAX)),
+        )
         .then(a.pane_id.cmp(&b.pane_id))
 }
 
@@ -84,6 +90,9 @@ pub struct AttentionModel {
     pub selected: usize,
     pub connected: bool,
     pub pulse: bool,
+    pub caps: Caps,
+    /// (pane_id, plain text) of the watched pane's screen.
+    pub screen: Option<(String, String)>,
 }
 
 impl AttentionModel {
@@ -119,7 +128,14 @@ impl AttentionModel {
     }
 
     /// Keep existing pad order; append newcomers by workspace number then pane id.
-    fn merge_agents(&mut self, incoming: Vec<AgentInfo>) {
+    /// A backend that supplies `order` (Rex) owns the layout: pads follow it exactly.
+    fn merge_agents(&mut self, mut incoming: Vec<AgentInfo>) {
+        if incoming.iter().any(|a| a.order.is_some()) {
+            let workspaces = &self.workspaces;
+            incoming.sort_by(|a, b| layout_cmp(workspaces, a, b));
+            self.agents = incoming;
+            return;
+        }
         let mut next: std::collections::HashMap<String, AgentInfo> = incoming
             .into_iter()
             .map(|a| (a.pane_id.clone(), a))
@@ -200,6 +216,12 @@ impl AttentionModel {
         self.agents.get(self.selected)
     }
 
+    /// Screen text, only if it belongs to the current selection.
+    pub fn selected_screen(&self) -> Option<&str> {
+        let (id, text) = self.screen.as_ref()?;
+        (self.selected_agent()?.pane_id == *id).then_some(text.as_str())
+    }
+
     pub fn window_hint_for_pane(&self, pane_id: &str) -> Option<String> {
         let ws = self
             .agents
@@ -228,6 +250,7 @@ impl AttentionModel {
         for a in &self.agents {
             a.pane_id.hash(&mut h);
             a.agent_status.hash(&mut h);
+            a.blocked_kind.hash(&mut h);
             a.name.hash(&mut h);
             a.display_agent.hash(&mut h);
             a.agent.hash(&mut h);
@@ -244,7 +267,12 @@ impl AttentionModel {
             a.title.hash(&mut h);
             a.tokens.get("summary").hash(&mut h);
             a.state_labels.hash(&mut h);
+            a.msg.hash(&mut h);
+            a.progress.hash(&mut h);
+            a.blocked_kind.hash(&mut h);
+            self.selected_screen().hash(&mut h);
         }
+        self.caps.respond.hash(&mut h);
         for w in self.workspaces.iter().take(8) {
             w.workspace_id.hash(&mut h);
             w.agent_status.hash(&mut h);
@@ -345,7 +373,7 @@ impl AttentionModel {
         let mut idle = 0;
         for a in &self.agents {
             match a.agent_status {
-                AgentStatus::Blocked => blocked += 1,
+                AgentStatus::Blocked | AgentStatus::Error => blocked += 1,
                 AgentStatus::Working => working += 1,
                 AgentStatus::Done => done += 1,
                 AgentStatus::Idle | AgentStatus::Unknown => idle += 1,
@@ -354,17 +382,21 @@ impl AttentionModel {
         (blocked, working, done, idle)
     }
 
-    pub fn pad_color(status: AgentStatus, pulse: bool, selected: bool) -> IndexedColor {
+    pub fn pad_color(agent: &AgentInfo, pulse: bool, selected: bool) -> IndexedColor {
         // Occupancy hue; Done is host unread (Idle occupancy, yellow pad).
         // Selected is same hue at max brightness (white silicone eats WHITE/GREY/SKY).
+        // Blocked pulses; its hue says what it waits on (Rex). Error is steady red.
+        let status = agent.agent_status;
         let base = match Occupancy::from(status) {
-            Occupancy::Blocked => {
-                if pulse {
-                    IndexedColor::PINK
-                } else {
-                    IndexedColor::MAGENTA
-                }
-            }
+            Occupancy::Blocked if status == AgentStatus::Error => IndexedColor::RED,
+            Occupancy::Blocked => match (agent.blocked_kind, pulse) {
+                (Some(BlockedKind::Question), true) => IndexedColor::PURPLE,
+                (Some(BlockedKind::Question), false) => IndexedColor::BLUE,
+                (Some(BlockedKind::Auth), true) => IndexedColor::ORANGE,
+                (Some(BlockedKind::Auth), false) => IndexedColor::AMBER,
+                (_, true) => IndexedColor::PINK,
+                (_, false) => IndexedColor::MAGENTA,
+            },
             Occupancy::Working => IndexedColor::GREEN,
             Occupancy::Idle if status == AgentStatus::Done => IndexedColor::YELLOW,
             Occupancy::Idle => IndexedColor::BLUE,
@@ -399,7 +431,7 @@ impl AttentionModel {
             }
             a.state_change_seq = a.state_change_seq.saturating_add(1);
         } else if !pane_id.is_empty() {
-            self.agents.push(crate::herdr::AgentInfo {
+            self.agents.push(crate::model::AgentInfo {
                 terminal_id: pane_id.to_string(),
                 name: None,
                 agent,
@@ -421,6 +453,7 @@ impl AttentionModel {
                 launch_pending: false,
                 screen_detection_skipped: false,
                 revision: 0,
+                ..Default::default()
             });
         }
         let sel = self.selected_pane_id();
@@ -446,6 +479,7 @@ impl AttentionModel {
 
     pub fn workspace_color(status: AgentStatus) -> IndexedColor {
         match Occupancy::from(status) {
+            Occupancy::Blocked if status == AgentStatus::Error => IndexedColor::RED,
             Occupancy::Blocked => IndexedColor::PINK,
             Occupancy::Working => IndexedColor::GREEN,
             Occupancy::Idle if status == AgentStatus::Done => IndexedColor::YELLOW,
@@ -511,6 +545,7 @@ mod tests {
             launch_pending: false,
             screen_detection_skipped: false,
             revision: 1,
+            ..Default::default()
         }
     }
 
@@ -659,21 +694,59 @@ mod tests {
     }
 
     #[test]
+    fn blocked_hue_follows_kind() {
+        let mut a = agent("p", AgentStatus::Blocked, 1);
+        let perm = AttentionModel::pad_color(&a, true, false);
+        a.blocked_kind = Some(BlockedKind::Question);
+        let ask = AttentionModel::pad_color(&a, true, false);
+        a.blocked_kind = Some(BlockedKind::Auth);
+        let auth = AttentionModel::pad_color(&a, true, false);
+        assert_eq!(perm, IndexedColor::PINK);
+        assert_ne!(ask, perm);
+        assert_ne!(auth, perm);
+        assert_ne!(auth, ask);
+        let err = agent("e", AgentStatus::Error, 1);
+        assert_eq!(
+            AttentionModel::pad_color(&err, true, false),
+            AttentionModel::pad_color(&err, false, false),
+            "error does not pulse"
+        );
+    }
+
+    #[test]
+    fn screen_only_for_selection() {
+        let mut m = AttentionModel {
+            agents: vec![
+                agent("a", AgentStatus::Idle, 1),
+                agent("b", AgentStatus::Idle, 1),
+            ],
+            connected: true,
+            ..AttentionModel::default()
+        };
+        m.screen = Some(("b".into(), "$ ls".into()));
+        assert_eq!(m.selected_screen(), None);
+        let before = m.view_sig();
+        m.selected = 1;
+        assert_eq!(m.selected_screen(), Some("$ ls"));
+        assert_ne!(m.view_sig(), before);
+    }
+
+    #[test]
     fn pad_color_status_hue_survives_selection() {
         use crate::device::IndexedColor;
         assert_eq!(
-            AttentionModel::pad_color(AgentStatus::Idle, false, false),
+            AttentionModel::pad_color(&agent("p", AgentStatus::Idle, 1), false, false),
             IndexedColor::BLUE
         );
         assert_eq!(
-            AttentionModel::pad_color(AgentStatus::Done, false, false),
+            AttentionModel::pad_color(&agent("p", AgentStatus::Done, 1), false, false),
             IndexedColor::YELLOW
         );
-        let sel_done = AttentionModel::pad_color(AgentStatus::Done, false, true);
+        let sel_done = AttentionModel::pad_color(&agent("p", AgentStatus::Done, 1), false, true);
         assert_ne!(sel_done, IndexedColor::WHITE);
         assert_eq!(sel_done.0 & !0x03, IndexedColor::YELLOW.0 & !0x03);
         assert_eq!(sel_done.0 & 0x03, 0x03);
-        let sel_work = AttentionModel::pad_color(AgentStatus::Working, false, true);
+        let sel_work = AttentionModel::pad_color(&agent("p", AgentStatus::Working, 1), false, true);
         assert_eq!(sel_work.0 & !0x03, IndexedColor::GREEN.0 & !0x03);
     }
 
@@ -719,11 +792,11 @@ mod tests {
         );
         assert_eq!(model.focus("missing"), None);
         assert_eq!(
-            AttentionModel::pad_color(AgentStatus::Done, false, false),
+            AttentionModel::pad_color(&agent("p", AgentStatus::Done, 1), false, false),
             IndexedColor::YELLOW
         );
         assert_eq!(
-            AttentionModel::pad_color(AgentStatus::Idle, false, false),
+            AttentionModel::pad_color(&agent("p", AgentStatus::Idle, 1), false, false),
             IndexedColor::BLUE
         );
         assert_eq!(

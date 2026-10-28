@@ -1,6 +1,9 @@
 pub mod app;
+pub mod backend;
 pub mod device;
 pub mod herdr;
 pub mod host;
+pub mod model;
 pub mod nihia;
+pub mod rex;
 pub mod surface;
