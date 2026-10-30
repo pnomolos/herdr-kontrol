@@ -35,6 +35,9 @@ const TERM: &str = "com.superlogical.terminal";
 const DEBOUNCE: Duration = Duration::from_millis(40);
 const SCREEN_EVERY: Duration = Duration::from_millis(1000);
 const SCREEN_LINES: usize = 40;
+/// Bytes of scrollback to read for the preview. Full output can pass the
+/// 1 MiB message limit (`too_large`); 48 KiB covers 40 lines of any width.
+const SCREEN_TAIL_BYTES: u64 = 48 * 1024;
 
 struct Driver {
     conn: Arc<Conn>,
@@ -426,16 +429,8 @@ impl Driver {
         let Some(sid) = self.mirror.locate(&block).map(|(s, _)| s.to_string()) else {
             return;
         };
-        let r = self
-            .conn
-            .call_value(
-                &format!("{TERM}.format"),
-                json!({"session_id": sid, "block_id": block,
-                       "args": {"format": "text", "trim": true}}),
-            )
-            .await;
-        let text = match r {
-            Ok(v) => tail(v["content"].as_str().unwrap_or_default(), SCREEN_LINES),
+        let text = match self.screen_tail(&sid, &block).await {
+            Ok(t) => tail(&t, SCREEN_LINES),
             Err(e) => {
                 debug!(%e, "screen poll");
                 return;
@@ -453,6 +448,59 @@ impl Driver {
 }
 
 /// Last `n` lines, ignoring trailing blank lines.
+impl Driver {
+    /// The end of a block's text output. `format{max_bytes}` returns the head
+    /// plus a blob id when there's more; then read the last chunk by offset.
+    /// Servers before revision 7 ignore `max_bytes` and return everything.
+    async fn screen_tail(&self, sid: &str, block: &str) -> Result<String> {
+        let v = self
+            .conn
+            .call_value(
+                &format!("{TERM}.format"),
+                json!({"session_id": sid, "block_id": block,
+                       "args": {"format": "text", "trim": true,
+                                "max_bytes": SCREEN_TAIL_BYTES}}),
+            )
+            .await?;
+        let content = v["content"].as_str().unwrap_or_default();
+        let (Some(id), Some(total)) = (v["id"].as_u64(), v["total"].as_u64()) else {
+            return Ok(content.to_string());
+        };
+        let start = total.saturating_sub(SCREEN_TAIL_BYTES);
+        // `max_bytes` counts JSON-escaped bytes (`\n` is two), so ask for 4x
+        // headroom; text escapes at most ~2x. The loop is a fallback only: a
+        // start mid-character comes back as U+FFFD, which skews `offset`.
+        let mut offset = start;
+        let mut data = String::new();
+        for _ in 0..4 {
+            let r = self
+                .conn
+                .call_value(
+                    &format!("{TERM}.blob_read"),
+                    json!({"session_id": sid, "block_id": block,
+                           "args": {"id": id, "offset": offset,
+                                    "max_bytes": SCREEN_TAIL_BYTES * 4}}),
+                )
+                .await?;
+            let chunk = r["data"].as_str().unwrap_or_default();
+            data.push_str(chunk);
+            offset += chunk.len() as u64;
+            if r["eof"].as_bool().unwrap_or(true) || chunk.is_empty() {
+                break;
+            }
+        }
+        Ok(skip_partial_line(&data, start > 0).to_string())
+    }
+}
+
+/// A read that starts mid-output likely starts mid-line; drop that fragment.
+fn skip_partial_line(s: &str, mid: bool) -> &str {
+    match (mid, s.find('\n')) {
+        (true, Some(i)) => &s[i + 1..],
+        _ => s,
+    }
+}
+
 fn tail(s: &str, n: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
     let end = lines
@@ -469,6 +517,16 @@ fn raise() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_first_line() {
+        assert_eq!(
+            skip_partial_line("ial line\nnext\nlast", true),
+            "next\nlast"
+        );
+        assert_eq!(skip_partial_line("whole\nnext", false), "whole\nnext");
+        assert_eq!(skip_partial_line("no newline", true), "no newline");
+    }
 
     #[test]
     fn tail_skips_trailing_blank() {

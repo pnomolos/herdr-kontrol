@@ -16,7 +16,10 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, trace};
 
-pub const API_REVISION: u64 = 4;
+/// Shapes this client is written for. 7 adds `format{max_bytes}` + `blob_read`.
+pub const API_REVISION: u64 = 7;
+/// Oldest revision we can work with; the server picks the newest both speak.
+pub const MIN_REVISION: u64 = 4;
 const PROTOCOL: &str = "rex.control.v1";
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_EVERY: Duration = Duration::from_secs(30);
@@ -118,6 +121,7 @@ pub async fn connect(socket: &Path) -> Result<(Conn, mpsc::UnboundedReceiver<Inb
     let hello = json!({
         "type": "hello",
         "api_revision": API_REVISION,
+        "api_min_revision": MIN_REVISION,
         "client": {
             "kind": "other",
             "platform": "macos",
@@ -142,8 +146,8 @@ pub async fn connect(socket: &Path) -> Result<(Conn, mpsc::UnboundedReceiver<Inb
         bail!("unexpected rex welcome: {welcome}");
     }
     let rev = welcome["api_revision"].as_u64().unwrap_or(0);
-    if rev < API_REVISION {
-        bail!("rex server speaks api_revision {rev}; need {API_REVISION}");
+    if rev < MIN_REVISION {
+        bail!("rex server speaks api_revision {rev}; need {MIN_REVISION}");
     }
     debug!(
         client = welcome["client"]["id"].as_str().unwrap_or(""),
